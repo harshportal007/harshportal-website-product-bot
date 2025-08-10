@@ -566,34 +566,34 @@ function makeTextCardSvg(title = 'Product', subtitle = '') {
 
 // --- Search the web for product name and get up to 3 image refs ---
 async function webSearchRefs(productName) {
+  if (!productName) return [];
   try {
     const query = encodeURIComponent(productName);
     const searchUrl = `https://api.duckduckgo.com/?q=${query}&format=json&no_redirect=1&t=hpbot`;
     const res = await fetch(searchUrl);
     const data = await res.json();
 
-    // DuckDuckGo "Image" results sometimes in RelatedTopics
     let urls = [];
     if (data?.Image) urls.push(data.Image);
     if (Array.isArray(data?.RelatedTopics)) {
-      data.RelatedTopics.forEach(t => {
-        if (t?.Icon?.URL) {
-          const abs = t.Icon.URL.startsWith('http') ? t.Icon.URL : `https://duckduckgo.com${t.Icon.URL}`;
-          urls.push(abs);
-        }
-      });
+      for (const t of data.RelatedTopics) {
+        const u = t?.Icon?.URL;
+        if (!u) continue;
+        const abs = u.startsWith('http') ? u : `https://duckduckgo.com${u}`;
+        urls.push(abs);
+      }
     }
 
-    urls = urls.filter(u => /\.(jpg|jpeg|png|webp)$/i.test(u)).slice(0, 3);
+    // keep only likely real images
+    urls = urls
+      .filter(Boolean)
+      .filter(u => /\.(jpg|jpeg|png|webp)(\?|$)/i.test(u))
+      .slice(0, 3);
 
     const refs = [];
     for (const u of urls) {
-      try {
-        const b = await fetchAsBase64(u);
-        if (b) refs.push(b);
-      } catch (e) {
-        console.warn('Failed ref fetch', e.message);
-      }
+      const b = await fetchAsBase64(u).catch(()=>null);
+      if (b) refs.push(b);
     }
     return refs;
   } catch (err) {
@@ -603,40 +603,58 @@ async function webSearchRefs(productName) {
 }
 
 
+
 async function ensureImageForProduct(prod, table, style = 'neo') {
-  // keep your existing manual image check here
-  if (prod?.image_url && prod.image_url.trim() !== '') {
-    return prod.image_url; // manual/uploaded URL — don't touch
+  // if a manual/upload image already exists, don't generate
+  if (prod?.image && String(prod.image).trim()) return prod.image;
+
+  // collect up to 3 web refs by name + include OG if you already found one
+  const refBlobs = [
+    ...(await webSearchRefs(prod?.name || prod?.title || '')),
+  ];
+  if (prod?.og_image) {
+    const ogb = await fetchAsBase64(prod.og_image).catch(()=>null);
+    if (ogb) refBlobs.unshift(ogb);
+  }
+  const refs = refBlobs.slice(0,3);
+
+  // 1) try photoreal packshot (no text)
+  try {
+    const p1 = await buildImagePrompt(prod, style, false, !_sharp);
+    let b1 = await generateProductImageBytes({ prompt: p1, refImages: refs });
+
+    // add server-side watermark if available; otherwise the prompt already asked for it
+    if (_sharp) {
+      const wm = await addWatermarkToBuffer(b1, 'Harshportal');
+      if (wm) b1 = wm;
+    }
+
+    return await uploadImageBufferToSupabase(b1, { table, filename: 'ai.png', contentType: 'image/png' });
+  } catch (e) {
+    console.warn('gen packshot failed:', e?.message || e);
   }
 
-  // auto-fetch up to 3 reference images from web search
-  const refBlobs = await webSearchRefs(prod?.name || prod?.title || '');
+  // 2) fallback: big readable title image (matches brand vibe)
+  try {
+    const p2 = await buildImagePrompt(prod, style, true, !_sharp);
+    let b2 = await generateProductImageBytes({ prompt: p2, refImages: refs });
 
-  // build prompt for 80–99% match
-  const p1 = await buildImagePrompt(prod, style, false, false);
+    if (_sharp) {
+      const wm2 = await addWatermarkToBuffer(b2, 'Harshportal');
+      if (wm2) b2 = wm2;
+    }
 
-  // generate image
-  let b1 = await generateProductImageBytes({ prompt: p1, refImages: refBlobs });
-
-  // add watermark if possible; else regenerate with prompt watermark
-  const wm = await addWatermarkToBuffer(b1, 'Harshportal');
-  if (wm) b1 = wm;
-  else {
-    const p2 = await buildImagePrompt(prod, style, false, true);
-    b1 = await generateProductImageBytes({ prompt: p2, refImages: refBlobs });
+    return await uploadImageBufferToSupabase(b2, { table, filename: 'ai.png', contentType: 'image/png' });
+  } catch (e) {
+    console.warn('gen title-image failed:', e?.message || e);
   }
 
-  // upload to Supabase (same as your existing flow)
-  const filePath = `products/${Date.now()}_${(prod?.name || 'image').replace(/\W+/g, '_')}.png`;
-  const { data, error } = await supabase.storage
-    .from('product-images')
-    .upload(filePath, b1, { contentType: 'image/png', upsert: true });
-
-  if (error) throw error;
-
-  const { publicURL } = supabase.storage.from('product-images').getPublicUrl(filePath);
-  return publicURL;
+  // 3) last-resort SVG (always works, with watermark text baked in)
+  const svg = makeTextCardSvg(prod?.name || 'Digital Product', prod?.plan || prod?.subcategory || '');
+  const svgBuf = Buffer.from(svg, 'utf8');
+  return uploadImageBufferToSupabase(svgBuf, { table, filename: 'ai.svg', contentType: 'image/svg+xml' });
 }
+
 
 
 /* --------------------- /style command --------------------- */
