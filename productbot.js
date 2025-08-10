@@ -122,6 +122,23 @@ async function getOG(url) {
   } finally { clearTimeout(t); }
 }
 
+
+function isSupabasePublicUrl(u='') {
+  try {
+    const url = new URL(u);
+    const base = new URL(process.env.SUPABASE_URL);
+    // true for {your}.supabase.co/storage/v1/object/public/<bucket>/...
+    return url.hostname === base.hostname && /\/storage\/v1\/object\/public\//.test(url.pathname);
+  } catch { return false; }
+}
+
+async function ensureHostedInSupabase(u, table, filenameHint='prod.jpg') {
+  if (!u || !/^https?:\/\//i.test(u)) return u;       // not a URL → nothing to do
+  if (isSupabasePublicUrl(u)) return u;               // already in your storage
+  return rehostToSupabase(u, filenameHint, table);    // rehost external URL
+}
+
+
 /* --------------- Supabase Storage (unchanged) --------------- */
 async function rehostToSupabase(fileUrl, filenameHint = 'image.jpg', table) {
   try {
@@ -923,13 +940,14 @@ async function ensureImageForProduct(prod, table, style = 'neo') {
 
   // 1) Brand-true logo tile (with name)
   try {
-   const prompt = await buildImagePrompt(prod, style, !_sharp /* ask prompt to add watermark only if sharp missing */);
-    const brandName = shortBrandName(prod);
-    let buf = await generateProductImageBytes({
-      prompt,
-      refImages: refBlobs,
-     brandName
-    });
+ const prompt = await buildImagePrompt(prod, style, !_sharp);
+const brandName = shortBrandName(prod);
+let buf = await generateProductImageBytes({
+  prompt,            // <= add this
+  refImages: refBlobs,
+  brandName
+});
+
 
     // Prefer server watermark (consistent & always visible)
       if (_sharp) {
@@ -1415,6 +1433,13 @@ bot.action('save', async (ctx) => {
   const baseTags = uniqMerge(prod.tags, ai.tags);
 
   if (updateId) {
+    if (prod.image && /^https?:\/\//i.test(prod.image) && !isSupabasePublicUrl(prod.image)) {
+  try {
+    prod.image = await ensureHostedInSupabase(prod.image, table);
+  } catch (e) {
+    await ctx.reply(`⚠️ Couldn't rehost image, keeping the original URL. ${e?.message ?? ''}`);
+  }
+}
     if (table === TABLES.products) {
       const payload = {
         name: prod.name,
@@ -1655,7 +1680,7 @@ async function applyInlineEdit(ctx) {
   }
 
   if (field === 'image' && /^https?:\/\//i.test(val)) {
-    prod.image = await rehostToSupabase(val, 'prod.jpg', rvw.table);
+    prod.image = await ensureHostedInSupabase(val, rvw.table);
   } else if (field === 'category') {
     ai.category = normalizeCategory({ ...prod, ...ai }, val);
   } else if (['name','plan','validity','price','description','originalPrice','stock'].includes(field)) {
