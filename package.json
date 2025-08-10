@@ -4,7 +4,9 @@
   "private": true,
   "description": "Telegram product bot (Telegraf + Supabase + Gemini)",
   "main": "productbot.js",
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node productbot.js",
     "dev": "NODE_ENV=development node productbot.js",
@@ -14,7 +16,6 @@
     "@google/generative-ai": "^0.21.0",
     "@supabase/supabase-js": "^2.54.0",
     "dotenv": "^17.2.1",
-    "node-fetch": "^3.3.2",
     "telegraf": "^4.16.3"
   }
 }
