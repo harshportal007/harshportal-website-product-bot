@@ -13,8 +13,6 @@ const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY); // ✅ keep
 
-// optional default bucket (only used by rehostToSupabase)
-const STORAGE_BUCKET = process.env.SUPABASE_BUCKET || 'exclusiveproduct-images';
 
 const CATEGORIES_ALLOWED = ['OTT Accounts', 'IPTV', 'Product Key', 'Download'];
 const categories = CATEGORIES_ALLOWED;
@@ -33,7 +31,7 @@ const toStr = (v) => {
 };
 
 const TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-flash';
-const textModel = genAI.getGenerativeModel({ model: TEXT_MODEL });
+
 
 const DEFAULT_IMAGE_MODEL =
   (process.env.GEMINI_IMAGE_MODEL && process.env.GEMINI_IMAGE_MODEL.trim()) ||
@@ -91,15 +89,22 @@ function normalizeCategory(prodLike = {}, aiCategory) {
 const findUrls = (txt = '') => (txt.match(/https?:\/\/\S+/gi) || []).slice(0, 3);
 
 async function getOG(url) {
+  
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), 10_000);
+
   try {
-    const res = await fetch(url, { timeout: 10_000 });
-    if (!res.ok) throw new Error(res.statusText);
+    const res = await fetch(url, { signal: ac.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const html = await res.text();
+
     const pick = (prop) => {
-      const r = new RegExp(`<meta[^>]+property=["']${prop}["'][^>]+content=["']([^"']+)["']`, 'i').exec(html)
-             || new RegExp(`<meta[^>]+name=["']${prop}["'][^>]+content=["']([^"']+)["']`, 'i').exec(html);
+      const r =
+        new RegExp(`<meta[^>]+property=["']${prop}["'][^>]+content=["']([^"']+)["']`, 'i').exec(html) ||
+        new RegExp(`<meta[^>]+name=["']${prop}["'][^>]+content=["']([^"']+)["']`, 'i').exec(html);
       return r ? r[1] : null;
     };
+
     return {
       title: pick('og:title') || pick('twitter:title'),
       description: pick('og:description') || pick('twitter:description'),
@@ -107,8 +112,12 @@ async function getOG(url) {
     };
   } catch {
     return {};
+  } finally {
+    clearTimeout(t);
   }
+  
 }
+
 
 /* --------------- Supabase Storage (optional) --------------- */
 async function rehostToSupabase(fileUrl, filenameHint = 'image.jpg', table) {
@@ -211,8 +220,7 @@ function getBrandStyle(prod) {
   return null;
 }
 
-/* --------------- AI helpers --------------- */
-const categoriesStr = categories.join(' | ');
+
 
 /** Stronger enrichment prompt – fix mess, but say "unknown" if unsure */
 async function enrichWithAI(prod, textHints = '', ogHints = {}) {
@@ -326,6 +334,62 @@ ${text}
   }
 }
 
+
+async function extractManyFromFreeform(text) {
+  const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
+  const prompt = `
+You will extract a LIST of products from messy text.
+Return ONLY JSON array in this exact shape (no prose):
+
+[
+  {"name":"","plan":"","validity":"","price":"","description":"","tags":[]},
+  ...
+]
+
+If something is missing, leave it empty string. Parse as many as possible.
+Text:
+"""${text}"""
+`;
+  try {
+    const out = await model.generateContent(prompt);
+    const raw = out.response.text();
+
+    // Try parse strict array first
+    let arr;
+    try {
+      const jsonMatch = raw.match(/\[[\s\S]*\]$/m);
+      if (jsonMatch) arr = JSON.parse(jsonMatch[0]);
+    } catch {}
+
+    // fallback: try to split by lines if not array
+    if (!Array.isArray(arr)) {
+      const lines = String(text).split(/\n+/).map(s => s.trim()).filter(Boolean);
+      arr = [];
+      for (const line of lines) {
+        const one = await extractFromFreeform(line);
+        if (one?.name) arr.push(one);
+      }
+    }
+
+    // normalize numbers + keep original text
+    arr = (arr || []).map(x => ({
+      name: x.name || '',
+      plan: x.plan || '',
+      validity: x.validity || '',
+      price: parsePrice(x.price),
+      description: x.description || '',
+      tags: Array.isArray(x.tags) ? x.tags.slice(0,8) : [],
+      _txt: text
+    }));
+
+    // filter empties
+    return arr.filter(x => x.name);
+  } catch {
+    return [];
+  }
+}
+
+
 /* ---------------- Gemini 2.0 Flash Preview image gen + Supabase upload ---------------- */
 // Replace your whole generateProductImageBytes() with this version
 // --- replace the whole function ---
@@ -432,63 +496,6 @@ async function ensureImageForProduct(prod, table, style = 'neo') {
   const svg = makeTextCardSvg(prod?.name || 'Digital Product', prod?.plan || prod?.subcategory || '');
   const svgBuf = Buffer.from(svg, 'utf8');
   return uploadImageBufferToSupabase(svgBuf, { table, filename: 'ai.svg', contentType: 'image/svg+xml' });
-}
-
-
-/* ---------- AI image generation (brand-adjacent + optional text) ---------- */
-const BRAND_HINTS = [
-  {
-    match: [/spotify/i],
-    palette: ['#1DB954', '#191414'],
-    motifs: [
-      'concentric circular sound waves',
-      'rounded-square app tile glow',
-      'equalizer bars',
-      'subtle vinyl-disc silhouette'
-    ],
-  },
-  {
-    match: [/netflix/i],
-    palette: ['#E50914', '#000000'],
-    motifs: ['red light beam forming abstract N', 'cinema screen glow', 'soft film grain vignette'],
-  },
-  {
-    match: [/prime\s?video|amazon\s?prime/i],
-    palette: ['#00A8E1', '#0E1111'],
-    motifs: ['clean play arrow silhouette', 'smile-curve arrow hint', 'edge glow'],
-  },
-  {
-    match: [/disney/i, /hotstar/i],
-    palette: ['#04144E', '#0B5AE0'],
-    motifs: ['starry arc glow', 'night-sky gradient', 'subtle bokeh'],
-  },
-  {
-    match: [/youtube/i],
-    palette: ['#FF0000', '#0F0F0F'],
-    motifs: ['rounded play triangle', 'screen reflection', 'subtle red glow'],
-  },
-  {
-    match: [/canva/i],
-    palette: ['#00C4CC', '#7D2AE8'],
-    motifs: ['fluid gradient splash', 'curvy vector shapes', 'pen-nib silhouette'],
-  },
-  {
-    match: [/vpn/i],
-    palette: ['#00D4FF', '#0B132B'],
-    motifs: ['shield silhouette', 'network nodes and lines', 'tunnel glow'],
-  },
-  {
-    match: [/iptv/i, /live tv/i],
-    palette: ['#22D3EE', '#0F172A'],
-    motifs: ['channel tiles mosaic', 'play button aura', 'signal waves'],
-  },
-];
-
-function pickBrandHints(prod = {}) {
-  const hay = [
-    prod.name, prod.description, prod.category, prod.subcategory, ...(prod.tags || []),
-  ].filter(Boolean).join(' ');
-  return BRAND_HINTS.find(h => h.match.some(rx => rx.test(hay))) || null;
 }
 
 /* ---------- AI image generation (brand-aware with optional text) ---------- */
@@ -711,6 +718,27 @@ bot.command('smartadd', (ctx) => {
   ctx.reply('Send the product text (can be messy). You may also attach a photo or include a URL.');
 });
 
+
+
+bot.command('toggle', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const id = (ctx.message.text.split(' ')[1] || '').trim();
+  if (!id) return ctx.reply('Usage: /toggle <id>');
+  if (!ctx.session.table) return ctx.reply('Choose table first with /table');
+
+  const table = ctx.session.table;
+  const { data, error } = await supabase.from(table).select('is_active').eq('id', id).maybeSingle();
+  if (error || !data) return ctx.reply('Not found.');
+
+  const { error: upErr } = await supabase.from(table)
+    .update({ is_active: !data.is_active })
+    .eq('id', id);
+
+  if (upErr) return ctx.reply(`❌ Toggle failed: ${upErr.message}`);
+  ctx.reply(`Toggled id ${id} to ${!data.is_active ? '✅ active' : '⛔️ inactive'}.`);
+});
+
+
 /* --------------------- text router --------------------- */
 bot.on('text', async (ctx, next) => {
   if (!isAdmin(ctx)) return;
@@ -759,6 +787,8 @@ bot.on('text', async (ctx, next) => {
   }
 
   // smart add
+
+
   if (ctx.session.mode === 'smart' && ctx.session.await === 'blob') {
     ctx.session.smart = { text: ctx.message.text, photo: null, og: {}, prod: {} };
     const urls = findUrls(ctx.message.text);
@@ -784,18 +814,94 @@ bot.on('text', async (ctx, next) => {
   }
 
   // gemini bulk continues...
-  if (ctx.session.mode === 'gemini') {
-    if (ctx.session.stage === 'paste') {
-      await ctx.reply('⏳ Extracting with Gemini…');
-      const items = await extractFromFreeform(ctx.message.text).then(p => p.name ? [p] : []);
-      if (!items.length) return ctx.reply('Could not detect a product. Use /smartadd and include more details.');
-      ctx.session.stage = 'step';
-      ctx.session.products = items;
-      ctx.session.index = 0;
-      await ctx.reply(`Detected *${items.length}* item. I’ll ask missing fields.`, { parse_mode: 'Markdown' });
+ // gemini bulk continues...
+if (ctx.session.mode === 'gemini') {
+  if (ctx.session.stage === 'paste') {
+    await ctx.reply('⏳ Detecting products…');
+    const items = await extractManyFromFreeform(ctx.message.text);
+    if (!items.length) return ctx.reply('Could not detect products. Try again with one-per-line.', { parse_mode:'Markdown' });
+
+    for (const it of items) {
+      const ai = await enrichWithAI(it, it._txt || ctx.message.text, {});
+      it._ai = ai;
+      it.name = ai.name || it.name;
+      it.description = ai.description || it.description;
+      it.price = it.price ?? (ai.price || null);
+      it.tags = uniqMerge(it.tags, ai.tags);
     }
+
+    ctx.session.stage = 'step';
+    ctx.session.products = items;
+    ctx.session.index = 0;
+    ctx.session.await = null;
+    await ctx.reply(`Detected *${items.length}* item(s). I’ll ask for any missing fields.`, { parse_mode: 'Markdown' });
+
+    // 👉 start the stepper now
     return handleBulkStep(ctx);
   }
+
+  // If we're waiting for a specific field for the current product, capture it first
+  if (ctx.session.stage === 'step' && ctx.session.await) {
+    const idx = ctx.session.index || 0;
+    const prod = ctx.session.products?.[idx];
+    if (!prod) return ctx.reply('No active item.');
+
+    const valRaw = ctx.message.text.trim();
+    const want = ctx.session.await;
+
+    if (want === 'price') {
+      prod.price = parsePrice(valRaw);
+      if (!prod.price) return ctx.reply('Enter a valid price (number).');
+      ctx.session.await = null;
+      return handleBulkStep(ctx);            // 👈 continue
+    } else if (want === 'originalPrice') {
+      prod.originalPrice = parsePrice(valRaw);
+      if (!prod.originalPrice) return ctx.reply('Enter a valid MRP (number).');
+      ctx.session.await = null;
+      return handleBulkStep(ctx);            // 👈 continue
+    } else if (want === 'stock') {
+      prod.stock = parsePrice(valRaw);
+      if (typeof prod.stock !== 'number') return ctx.reply('Enter a valid stock count (number).');
+      ctx.session.await = null;
+      return handleBulkStep(ctx);            // 👈 continue
+    } else if (want === 'image') {
+      if (/^generate$/i.test(valRaw)) {
+        try {
+          await ctx.reply('🎨 Generating image…');
+          const ai = prod._ai || await enrichWithAI(prod, prod._txt || '', {});
+          const url = await ensureImageForProduct({ ...prod, ...ai }, ctx.session.table, ctx.session.style || 'neo');
+          prod.image = url;
+          ctx.session.await = null;
+          return handleBulkStep(ctx);        // 👈 continue
+        } catch (e) {
+          console.error('bulk image generate failed:', e);
+          return ctx.reply('⚠️ Could not generate. Upload a photo or paste an image URL, or type "skip".');
+        }
+      } else if (/^skip$/i.test(valRaw)) {
+        prod.image = null;
+        ctx.session.await = null;
+        return handleBulkStep(ctx);          // 👈 continue
+      } else if (/^https?:\/\//i.test(valRaw)) {
+        try {
+          prod.image = await rehostToSupabase(valRaw, 'prod.jpg', ctx.session.table);
+          ctx.session.await = null;
+          return handleBulkStep(ctx);        // 👈 continue
+        } catch {
+          return ctx.reply('Could not fetch that URL. Upload a photo or type "generate" or "skip".');
+        }
+      } else {
+        return ctx.reply('Upload a photo, paste an image URL, type "generate", or "skip".');
+      }
+    }
+  }
+
+  // If we’re in gemini mode but not awaiting a field, drive the flow
+  if (!ctx.session.review) {
+  return handleBulkStep(ctx);
+}          
+}
+
+
 
   // inline edit handler text (applies for /update too)
   if (ctx.session.awaitEdit) {
@@ -810,29 +916,33 @@ bot.on('text', async (ctx, next) => {
 bot.on('photo', async (ctx) => {
   if (!isAdmin(ctx)) return;
 
+  // get the largest photo's fileId once
+  const photos = ctx.message?.photo || [];
+  const fileId = photos.at(-1)?.file_id;
+  if (!fileId) return;
+
+  const fileLink = await ctx.telegram.getFileLink(fileId);
+  const href = typeof fileLink === 'string' ? fileLink : fileLink.href;
+
   /* --- EDIT MODE: user tapped "image" and uploaded a new photo --- */
-  // EDIT MODE: upload photo -> rehost to the right bucket by table
   if (ctx.session.awaitEdit === 'image' && ctx.session.review) {
     try {
-      const fileId = ctx.message.photo.pop().file_id;
-      const fileLink = await ctx.telegram.getFileLink(fileId);
-      const imgUrl = await rehostToSupabase(fileLink.href, 'prod.jpg', ctx.session.review.table);
+      const { table } = ctx.session.review;
+      const imgUrl = await rehostToSupabase(href, 'prod.jpg', table);
       ctx.session.review.prod.image = imgUrl;
       ctx.session.awaitEdit = null;
-      const { prod, ai, table } = ctx.session.review;
+      const { prod, ai } = ctx.session.review;
       await ctx.replyWithMarkdownV2(reviewMessage(prod, ai, table), kbConfirm);
     } catch (e) {
       console.error('edit image upload error:', e);
       await ctx.reply('❌ Could not update image. Try again or paste a direct image URL.');
     }
+    return;
   }
 
   // --- manual wizard photo ---
   if (ctx.session.mode === 'manual-photo') {
-    const fileId = ctx.message.photo.pop().file_id;
-    const fileLink = await ctx.telegram.getFileLink(fileId);
-    const imgUrl = await rehostToSupabase(fileLink.href, 'prod.jpg', ctx.session.table);
-
+    const imgUrl = await rehostToSupabase(href, 'prod.jpg', ctx.session.table);
     const prod = ctx.session.form.prod;
     prod.image = imgUrl;
 
@@ -843,9 +953,7 @@ bot.on('photo', async (ctx) => {
 
   // --- smart add photo ---
   if (ctx.session.mode === 'smart-photo') {
-    const fileId = ctx.message.photo.pop().file_id;
-    const fileLink = await ctx.telegram.getFileLink(fileId);
-    ctx.session.smart.photo = await rehostToSupabase(fileLink.href, 'prod.jpg', ctx.session.table);
+    ctx.session.smart.photo = await rehostToSupabase(href, 'prod.jpg', ctx.session.table);
 
     const prod = { ...ctx.session.smart.prod, image: ctx.session.smart.photo };
     const ai = await enrichWithAI(prod, ctx.session.smart.text, ctx.session.smart.og);
@@ -854,7 +962,22 @@ bot.on('photo', async (ctx) => {
     ctx.session.mode = null;
     return ctx.replyWithMarkdownV2(reviewMessage(ctx.session.review.prod, ai, ctx.session.table), kbConfirm);
   }
+
+  // --- BULK: waiting for an image ---
+  if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && ctx.session.await === 'image') {
+    try {
+      const imgUrl = await rehostToSupabase(href, 'prod.jpg', ctx.session.table);
+      const idx = ctx.session.index || 0;
+      if (ctx.session.products?.[idx]) ctx.session.products[idx].image = imgUrl;
+      ctx.session.await = null;
+      return handleBulkStep(ctx);
+    } catch (e) {
+      console.error('bulk photo upload error:', e);
+      return ctx.reply('❌ Could not upload that image. Try again.');
+    }
+  }
 });
+
 
 /* If smart add user types "skip" instead of photo -> ask to generate */
 bot.hears(/^skip$/i, async (ctx) => {
@@ -866,6 +989,8 @@ bot.hears(/^skip$/i, async (ctx) => {
     await ctx.reply('No image provided. Do you want me to generate a product image for you?', kbGenImage);
   }
 });
+
+
 
 /* --------------------- callbacks --------------------- */
 bot.action('cancel', (ctx) => {
@@ -925,8 +1050,15 @@ bot.action('save', async (ctx) => {
         await ctx.reply('What next?', kbAfterTask());
       }
     }
-    ctx.session.review = null;
+        ctx.session.review = null;
+    // if we are in bulk mode, continue to next product
+    if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && Array.isArray(ctx.session.products)) {
+      return handleBulkStep(ctx);
+    }
+    // otherwise end the flow
+    ctx.session.mode = null;
     return;
+
   }
 
   // INSERT new (dupe guard)
@@ -986,7 +1118,10 @@ bot.action('save', async (ctx) => {
     }
   }
 
-  ctx.session.review = null;
+   ctx.session.review = null;
+  if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && Array.isArray(ctx.session.products)) {
+    return handleBulkStep(ctx);
+  }
   ctx.session.mode = null;
   return;
 });
@@ -1014,6 +1149,7 @@ bot.action('back_review', (ctx) => {
 
 bot.action('gen_img_no', async (ctx) => {
   ctx.answerCbQuery();
+  if (!ctx.session.smart?.prod) return ctx.reply('No active product.');
   const prod = { ...ctx.session.smart.prod, image: null };
   const ai = await enrichWithAI(prod, ctx.session.smart.text, ctx.session.smart.og);
   ctx.session.review = { prod: { ...prod, tags: uniqMerge(prod.tags, ai.tags) }, ai, table: ctx.session.table };
@@ -1022,6 +1158,7 @@ bot.action('gen_img_no', async (ctx) => {
 });
 
 bot.action('gen_img_yes', async (ctx) => {
+  if (!ctx.session.smart?.prod) { ctx.answerCbQuery(); return ctx.reply('No active product.'); }
   ctx.answerCbQuery('Generating…');
   try {
     await ctx.reply('🎨 Generating image… this can take ~10–20s.');
@@ -1153,23 +1290,51 @@ bot.command('update', async (ctx) => {
 /* --------------------- bulk driver --------------------- */
 async function handleBulkStep(ctx) {
   const table = ctx.session.table;
-  const idx = ctx.session.index;
-  if (idx >= ctx.session.products.length) {
-    ctx.session.mode = null;
-    return ctx.reply('All products processed.', kbAfterTask());
-  }
-  const prod = ctx.session.products[idx];
-  if (!prod._ai) prod._ai = await enrichWithAI(prod, '', {});
-  if (!ok(prod.price)) { ctx.session.await = 'price'; return ctx.reply(`Enter *price* for "${prod.name}"`, { parse_mode: 'Markdown' }); }
-  if (table === TABLES.products && !ok(prod.originalPrice)) { ctx.session.await = 'originalPrice'; return ctx.reply(`Enter *MRP* for "${prod.name}"`, { parse_mode: 'Markdown' }); }
-  if (table === TABLES.products && !ok(prod.stock)) { ctx.session.await = 'stock'; return ctx.reply(`Enter *stock* for "${prod.name}"`, { parse_mode: 'Markdown' }); }
-  if (!ok(prod.image)) { ctx.session.await = 'image'; return ctx.reply(`Upload *image* for "${prod.name}"`, { parse_mode: 'Markdown' }); }
+  const items = ctx.session.products || [];
+  const idx = ctx.session.index || 0;
 
+  // finished?
+  if (idx >= items.length) {
+    ctx.session.mode = null;
+    ctx.session.stage = null;
+    ctx.session.await = null;
+    return ctx.reply('All products processed. ✅', kbAfterTask());
+  }
+
+  const prod = items[idx];
+
+  // ensure AI enrich present
+  if (!prod._ai) {
+    prod._ai = await enrichWithAI(prod, prod._txt || '', {});
+  }
+
+  // ask for missing fields
+  if (!ok(prod.price)) {
+    ctx.session.await = 'price';
+    return ctx.reply(`Enter *price* for "${prod.name}"`, { parse_mode: 'Markdown' });
+  }
+  if (table === TABLES.products && !ok(prod.originalPrice)) {
+    ctx.session.await = 'originalPrice';
+    return ctx.reply(`Enter *MRP* for "${prod.name}"`, { parse_mode: 'Markdown' });
+  }
+  if (table === TABLES.products && !ok(prod.stock)) {
+    ctx.session.await = 'stock';
+    return ctx.reply(`Enter *stock* for "${prod.name}"`, { parse_mode: 'Markdown' });
+  }
+  if (!ok(prod.image)) {
+    ctx.session.await = 'image';
+    return ctx.reply(`Upload *image* for "${prod.name}" (or type "generate" / "skip" / paste URL)`, { parse_mode: 'Markdown' });
+  }
+
+  // ready to review this item
   ctx.session.review = { prod, ai: prod._ai, table };
   await ctx.replyWithMarkdownV2(reviewMessage(prod, prod._ai, table), kbConfirm);
-  ctx.session.index += 1;
+
+  // advance index so after Save we move to the next
+  ctx.session.index = idx + 1;
   ctx.session.await = null;
 }
+
 
 /* --------------------- errors & launch --------------------- */
 bot.catch((err, ctx) => {
