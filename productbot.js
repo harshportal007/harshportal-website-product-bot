@@ -13,7 +13,6 @@ const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY); // ✅ keep
 
-
 const CATEGORIES_ALLOWED = ['OTT Accounts', 'IPTV', 'Product Key', 'Download'];
 const categories = CATEGORIES_ALLOWED;
 
@@ -31,12 +30,9 @@ const toStr = (v) => {
 };
 
 const TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-flash';
-
-
 const DEFAULT_IMAGE_MODEL =
   (process.env.GEMINI_IMAGE_MODEL && process.env.GEMINI_IMAGE_MODEL.trim()) ||
   'gemini-2.0-flash-exp';
-
 
 // Escape MarkdownV2 for Telegram safely
 const escapeMd = (v = '') => toStr(v).replace(/([_\*\[\]\(\)~`>#+\-=|{}\.!])/g, '\\$1');
@@ -86,40 +82,32 @@ function normalizeCategory(prodLike = {}, aiCategory) {
 }
 
 /* --------------- OpenGraph hinting from URLs --------------- */
-const findUrls = (txt = '') => (txt.match(/https?:\/\/\S+/gi) || []).slice(0, 3);
+const findUrls = (txt = '') => (txt.match(/https?:\/\/\S+/gi) || []).slice(0, 5);
 
 async function getOG(url) {
-  
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), 10_000);
-
   try {
     const res = await fetch(url, { signal: ac.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const html = await res.text();
-
     const pick = (prop) => {
       const r =
         new RegExp(`<meta[^>]+property=["']${prop}["'][^>]+content=["']([^"']+)["']`, 'i').exec(html) ||
         new RegExp(`<meta[^>]+name=["']${prop}["'][^>]+content=["']([^"']+)["']`, 'i').exec(html);
       return r ? r[1] : null;
     };
-
     return {
       title: pick('og:title') || pick('twitter:title'),
       description: pick('og:description') || pick('twitter:description'),
-      image: pick('og:image') || pick('twitter:image'),
+      image: pick('og:image:secure_url') || pick('og:image') || pick('twitter:image'),
     };
   } catch {
     return {};
-  } finally {
-    clearTimeout(t);
-  }
-  
+  } finally { clearTimeout(t); }
 }
 
-
-/* --------------- Supabase Storage (optional) --------------- */
+/* --------------- Supabase Storage (unchanged) --------------- */
 async function rehostToSupabase(fileUrl, filenameHint = 'image.jpg', table) {
   try {
     const res = await fetch(fileUrl);
@@ -220,9 +208,39 @@ function getBrandStyle(prod) {
   return null;
 }
 
+/* ---------------- NEW: small helpers for refs + watermark ---------------- */
+async function fetchAsBase64(url) {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`ref fetch ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    const mime = res.headers.get('content-type') || 'image/jpeg';
+    return { mime, b64: buf.toString('base64') };
+  } catch (e) {
+    console.warn('ref image fetch failed:', e.message);
+    return null;
+  }
+}
 
+// optional watermark with sharp; fall back to prompt watermark
+let _sharp = null;
+try { _sharp = require('sharp'); } catch {}
+async function addWatermarkToBuffer(buf, text = 'Harshportal') {
+  if (!_sharp) return null; // signal: do prompt watermark instead
+  const svg = Buffer.from(`
+  <svg xmlns="http://www.w3.org/2000/svg" width="800" height="200">
+    <style>
+      .w{font-family: Segoe UI, Roboto, Arial; font-size:72px; font-weight:700; fill:#ffffff; opacity:.18;}
+    </style>
+    <text x="100%" y="80%" text-anchor="end" class="w">${text}</text>
+  </svg>`);
+  return await _sharp(buf)
+    .composite([{ input: svg, gravity: 'southeast', blend: 'over' }])
+    .png()
+    .toBuffer();
+}
 
-/** Stronger enrichment prompt – fix mess, but say "unknown" if unsure */
+/* ---------------- AI enrichment (unchanged logic) ---------------- */
 async function enrichWithAI(prod, textHints = '', ogHints = {}) {
   const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
   const brand = getBrandStyle?.(prod); // optional: from your brand helpers
@@ -248,8 +266,8 @@ Return ONLY JSON:
   "tags": ["3-8 tags"],
   "category": "one of: ${categories.join(' | ')}",
   "subcategory": "string|unknown",
-  "features": ["3-6 concise bullet phrases"],        // e.g. ["Ad-free listening","Offline downloads"]
-  "gradient": ["#hex1","#hex2"]                      // 2 colors best matching brand/theme
+  "features": ["3-6 concise bullet phrases"],
+  "gradient": ["#hex1","#hex2"]
 }
 `;
 
@@ -271,7 +289,6 @@ Return ONLY JSON:
     // Features (normalize to 3–6 short items)
     let feats = Array.isArray(json.features) ? json.features : [];
     if (!feats.length && textHints) {
-      // fallback: mine bullet-y phrases from the user text
       feats = String(textHints)
         .split(/\n|[;•·\-–—]\s+/g)
         .map(s => s.trim())
@@ -296,7 +313,7 @@ Return ONLY JSON:
     return json;
   } catch (e) {
     console.error('AI enrich error:', e.message);
-    // Safe fallback with minimal fields; still clamp category and give a gradient
+    // Safe fallback
     const palette = (getBrandStyle?.(prod)?.palette?.slice(0,2)) || ['#0ea5e9','#7c3aed'];
     return {
       name: prod.name || '',
@@ -334,6 +351,22 @@ ${text}
   }
 }
 
+/* ---- Robust array parse to avoid "Could not detect products" ---- */
+function tryParseJsonArrayAnywhere(raw) {
+  if (!raw) return null;
+  let s = String(raw).trim();
+  s = s.replace(/```(?:json)?\s*([\s\S]*?)\s*```/gi, '$1'); // strip code fences
+  const start = s.indexOf('[');
+  if (start === -1) return null;
+  let depth = 0, end = -1;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '[') depth++;
+    if (ch === ']') { depth--; if (depth === 0) { end = i; break; } }
+  }
+  if (end === -1) return null;
+  try { return JSON.parse(s.slice(start, end + 1)); } catch { return null; }
+}
 
 async function extractManyFromFreeform(text) {
   const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
@@ -342,11 +375,9 @@ You will extract a LIST of products from messy text.
 Return ONLY JSON array in this exact shape (no prose):
 
 [
-  {"name":"","plan":"","validity":"","price":"","description":"","tags":[]},
-  ...
+  {"name":"","plan":"","validity":"","price":"","description":"","tags":[]}
 ]
 
-If something is missing, leave it empty string. Parse as many as possible.
 Text:
 """${text}"""
 `;
@@ -354,15 +385,10 @@ Text:
     const out = await model.generateContent(prompt);
     const raw = out.response.text();
 
-    // Try parse strict array first
-    let arr;
-    try {
-      const jsonMatch = raw.match(/\[[\s\S]*\]$/m);
-      if (jsonMatch) arr = JSON.parse(jsonMatch[0]);
-    } catch {}
-
-    // fallback: try to split by lines if not array
+    // robust parse
+    let arr = tryParseJsonArrayAnywhere(raw);
     if (!Array.isArray(arr)) {
+      // fallback: try to split by lines if not array
       const lines = String(text).split(/\n+/).map(s => s.trim()).filter(Boolean);
       arr = [];
       for (const line of lines) {
@@ -389,27 +415,86 @@ Text:
   }
 }
 
+/* ---------------- IMAGE GENERATION: match 80–99% + watermark ---------------- */
 
-/* ---------------- Gemini 2.0 Flash Preview image gen + Supabase upload ---------------- */
-// Replace your whole generateProductImageBytes() with this version
-// --- replace the whole function ---
-async function generateProductImageBytes(prompt) {
+// Build prompt for packshot (no text) or title mode, allow prompt-watermark flag
+// 80–99% match prompt builder (supports optional prompt-watermark)
+async function buildImagePrompt(prod, styleName = 'neo', forceText = false, wantPromptWatermark = false) {
+  const model = genAI.getGenerativeModel({ model: TEXT_MODEL });
+  const themeText = STYLE_THEMES[styleName] || STYLE_THEMES.neo;
+
+  const brand = getBrandStyle(prod);
+  const brandName = brand?.name || (prod?.category || 'Digital product');
+  const palette = brand?.palette?.join(', ') || 'teal, cyan, indigo on dark';
+  const brandHints = brand?.keywords || 'clean geometric packshot cues';
+
+  const sys = `
+You will write a single, precise prompt for an image model that may also receive 0..3 reference images.
+Goal: photoreal/hyperreal **packshot** that matches the *actual product* **80–99%** (shape, color, materials, iconography).
+Square 1:1. Clean studio background (subtle gradient ok). No borders. No watermarks unless requested.
+If "includeText" is true, render large clean title text; otherwise **no text**.`;
+
+  const user = `
+Product:
+${JSON.stringify({
+  name: prod?.name,
+  plan: prod?.plan,
+  validity: prod?.validity,
+  category: prod?.category,
+  subcategory: prod?.subcategory,
+  tags: prod?.tags
+})}
+
+Brand/context: ${brandName}
+Palette: ${palette}
+Motifs: ${brandHints}
+Theme: ${themeText}
+
+Composition:
+- centered hero packshot; crisp edges; accurate proportions and true colors
+- match any provided reference images **80–99%** (treat them as ground truth)
+- avoid generic repeated gradient circles; vary style per product
+- background may be subtle studio/brand gradient, not busy
+
+${forceText ? `includeText: true (big, legible): "${prod?.name || brandName}"` : 'includeText: false'}
+${wantPromptWatermark ? 'Add a tiny, subtle corner watermark text: "Harshportal".' : ''}
+
+Negative: busy/noisy patterns, heavy glare, unreadable tiny text, extra logos, watermarks (unless requested), borders.`;
+
+  try {
+    const out = await model.generateContent([{ role: 'user', parts: [{ text: sys + '\n' + user }]}]);
+    return out.response.text().trim().replace(/\s+/g, ' ');
+  } catch {
+    // safe fallback
+    return `Photoreal packshot of ${prod?.name || brandName}, square 1:1, ${themeText}, colors ${palette}, match real product 80–99%, ${forceText ? `with big readable "${prod?.name || brandName}" text` : 'no text'}, clean studio background.`;
+  }
+}
+
+
+// Accept refs and build parts accordingly
+async function generateProductImageBytes({ prompt, refImages = [] }) {
   const candidates = Array.from(new Set([
-    DEFAULT_IMAGE_MODEL,           // env or default 'gemini-2.0-flash-exp'
+    DEFAULT_IMAGE_MODEL,
     'gemini-2.0-flash-exp',
     'gemini-2.0-flash'
   ]));
-
   let lastErr;
+
+  const parts = [];
+  for (const r of (refImages || []).slice(0,3)) {
+    if (r?.b64) parts.push({ inlineData: { data: r.b64, mimeType: r.mime || 'image/jpeg' } });
+  }
+  parts.push({ text: prompt });
+
   for (const id of candidates) {
     try {
       const model = genAI.getGenerativeModel({ model: id });
       const res = await model.generateContent({
-        contents: [{ role: 'user', parts: [{ text: prompt }]}],
+        contents: [{ role: 'user', parts }],
         generationConfig: { responseModalities: ['TEXT', 'IMAGE'] },
       });
-      const parts = res.response?.candidates?.[0]?.content?.parts ?? [];
-      const imagePart = parts.find(p => p.inlineData && p.inlineData.data);
+      const prts = res.response?.candidates?.[0]?.content?.parts ?? [];
+      const imagePart = prts.find(p => p.inlineData && p.inlineData.data);
       if (!imagePart) throw new Error('No inline image returned');
       return Buffer.from(imagePart.inlineData.data, 'base64');
     } catch (e) {
@@ -421,7 +506,6 @@ async function generateProductImageBytes(prompt) {
   err.cause = lastErr;
   throw err;
 }
-
 
 async function uploadImageBufferToSupabase(
   buf,
@@ -446,6 +530,7 @@ async function uploadImageBufferToSupabase(
   return pub.publicUrl;
 }
 
+/* Title SVG (bigger, auto-scales) */
 function makeTextCardSvg(title = 'Product', subtitle = '') {
   const brand = getBrandStyle?.({ name: title }) || null;
   const [c1, c2] = (brand?.palette && brand.palette.length >= 2)
@@ -462,87 +547,97 @@ function makeTextCardSvg(title = 'Product', subtitle = '') {
     <stop offset="0%" stop-color="${c1}"/><stop offset="100%" stop-color="${c2}"/>
   </linearGradient></defs>
   <rect width="1024" height="1024" fill="url(#g)"/>
-  <circle cx="512" cy="512" r="380" fill="rgba(0,0,0,0.18)"/>
-  <text x="50%" y="50%" fill="#fff" font-family="Segoe UI, Roboto, Arial" font-size="80" font-weight="700"
+  <circle cx="512" cy="512" r="360" fill="rgba(0,0,0,0.18)"/>
+  <text x="50%" y="50%" fill="#fff" font-family="Segoe UI, Roboto, Arial" font-size="110" font-weight="800"
         text-anchor="middle" dominant-baseline="central">${t}</text>
-  ${sub ? `<text x="50%" y="60%" fill="rgba(255,255,255,0.92)" font-family="Segoe UI, Roboto, Arial"
-        font-size="42" text-anchor="middle">${sub}</text>` : ''}
+  ${sub ? `<text x="50%" y="62%" fill="rgba(255,255,255,0.92)" font-family="Segoe UI, Roboto, Arial"
+        font-size="46" text-anchor="middle">${sub}</text>` : ''}
+  <text x="96%" y="96%" fill="rgba(255,255,255,0.22)" font-family="Segoe UI, Roboto, Arial"
+        font-size="40" text-anchor="end">Harshportal</text>
 </svg>`.trim();
 }
 
+/** MAIN: generate image for a product with ref-match + watermark
+ *  Priority inside generation:
+ *   1) Photoreal/hyperreal packshot (no text), match refs 80–99%, watermark applied server-side if possible
+ *   2) Title image (big readable text), brand/vibe matched, watermark
+ *   3) SVG fallback (always works), watermark baked
+ */
 
-/** Convenience: try brand-adjacent, then force big text fallback */
-// --- replace your ensureImageForProduct with this ---
+// --- Search the web for product name and get up to 3 image refs ---
+async function webSearchRefs(productName) {
+  try {
+    const query = encodeURIComponent(productName);
+    const searchUrl = `https://api.duckduckgo.com/?q=${query}&format=json&no_redirect=1&t=hpbot`;
+    const res = await fetch(searchUrl);
+    const data = await res.json();
+
+    // DuckDuckGo "Image" results sometimes in RelatedTopics
+    let urls = [];
+    if (data?.Image) urls.push(data.Image);
+    if (Array.isArray(data?.RelatedTopics)) {
+      data.RelatedTopics.forEach(t => {
+        if (t?.Icon?.URL) {
+          const abs = t.Icon.URL.startsWith('http') ? t.Icon.URL : `https://duckduckgo.com${t.Icon.URL}`;
+          urls.push(abs);
+        }
+      });
+    }
+
+    urls = urls.filter(u => /\.(jpg|jpeg|png|webp)$/i.test(u)).slice(0, 3);
+
+    const refs = [];
+    for (const u of urls) {
+      try {
+        const b = await fetchAsBase64(u);
+        if (b) refs.push(b);
+      } catch (e) {
+        console.warn('Failed ref fetch', e.message);
+      }
+    }
+    return refs;
+  } catch (err) {
+    console.warn('webSearchRefs failed:', err.message);
+    return [];
+  }
+}
+
+
 async function ensureImageForProduct(prod, table, style = 'neo') {
-  // try brand-adjacent (no text)
-  try {
-    const p1 = await buildImagePrompt(prod, style, false);
-    const b1 = await generateProductImageBytes(p1);
-    return await uploadImageBufferToSupabase(b1, { table, filename: 'ai.png', contentType: 'image/png' });
-  } catch (e) {
-    console.warn('Image gen try #1 failed; will try with text:', e?.message || e);
+  // keep your existing manual image check here
+  if (prod?.image_url && prod.image_url.trim() !== '') {
+    return prod.image_url; // manual/uploaded URL — don't touch
   }
 
-  // try with large product text
-  try {
-    const p2 = await buildImagePrompt(prod, style, true);
-    const b2 = await generateProductImageBytes(p2);
-    return await uploadImageBufferToSupabase(b2, { table, filename: 'ai.png', contentType: 'image/png' });
-  } catch (e) {
-    console.warn('Image gen try #2 failed; falling back to SVG text card:', e?.message || e);
+  // auto-fetch up to 3 reference images from web search
+  const refBlobs = await webSearchRefs(prod?.name || prod?.title || '');
+
+  // build prompt for 80–99% match
+  const p1 = await buildImagePrompt(prod, style, false, false);
+
+  // generate image
+  let b1 = await generateProductImageBytes({ prompt: p1, refImages: refBlobs });
+
+  // add watermark if possible; else regenerate with prompt watermark
+  const wm = await addWatermarkToBuffer(b1, 'Harshportal');
+  if (wm) b1 = wm;
+  else {
+    const p2 = await buildImagePrompt(prod, style, false, true);
+    b1 = await generateProductImageBytes({ prompt: p2, refImages: refBlobs });
   }
 
-  // final fallback: SVG text card (always works)
-  const svg = makeTextCardSvg(prod?.name || 'Digital Product', prod?.plan || prod?.subcategory || '');
-  const svgBuf = Buffer.from(svg, 'utf8');
-  return uploadImageBufferToSupabase(svgBuf, { table, filename: 'ai.svg', contentType: 'image/svg+xml' });
+  // upload to Supabase (same as your existing flow)
+  const filePath = `products/${Date.now()}_${(prod?.name || 'image').replace(/\W+/g, '_')}.png`;
+  const { data, error } = await supabase.storage
+    .from('product-images')
+    .upload(filePath, b1, { contentType: 'image/png', upsert: true });
+
+  if (error) throw error;
+
+  const { publicURL } = supabase.storage.from('product-images').getPublicUrl(filePath);
+  return publicURL;
 }
 
-/* ---------- AI image generation (brand-aware with optional text) ---------- */
-async function buildImagePrompt(prod, styleName = 'neo', forceText = false) {
-  const model = genAI.getGenerativeModel({ model: TEXT_MODEL }); // reuse your text model
-  const themeText = STYLE_THEMES[styleName] || STYLE_THEMES.neo;
-
-  const brand = getBrandStyle(prod);
-  const brandName = brand?.name || (prod?.category || 'Digital product');
-  const palette = brand?.palette?.join(', ') || 'teal, cyan, indigo on dark';
-  const brandHints = brand?.keywords || 'clean geometric icon, product glyph';
-
-  // Ask Gemini to compress to one powerful line
-  const sys = `
-You create single-line prompts for an image model. Prefer brand-colored abstract/icon motifs.
-If asked to include text, render the product name in large clean typography.
-Keep composition 1:1, centered, ecommerce-hero look.`;
-  const user = `
-Product JSON:
-${JSON.stringify({
-  name: prod?.name,
-  plan: prod?.plan,
-  validity: prod?.validity,
-  category: prod?.category,
-  subcategory: prod?.subcategory,
-  tags: prod?.tags
-}, null, 0)}
-
-Brand/context: ${brandName}
-Palette: ${palette}
-Motifs: ${brandHints}
-Theme: ${themeText}
-
-${forceText
-  ? `Include large centered text: "${prod?.name || brandName}" with tasteful iconography.`
-  : 'Prefer strong brand-adjacent iconography; text allowed if it improves clarity.'}
-
-Avoid real trademark logos/watermarks. Ratio 1:1.`;
-
-  try {
-    const out = await model.generateContent([{role:'user',parts:[{text: sys + '\n' + user}]}]);
-    return out.response.text().trim().replace(/\s+/g, ' ');
-  } catch {
-    // solid fallback
-    return `Abstract ${brandName} product tile, colors ${palette}, ${themeText}, centered, ${forceText ? `with big text "${prod?.name || brandName}"` : 'iconography'}, 1:1`;
-  }
-}
 
 /* --------------------- /style command --------------------- */
 const STYLE_KEYS = Object.keys(STYLE_THEMES); // ['neo','minimal','gradient','cyber','clay']
@@ -622,7 +717,6 @@ function reviewMessage(prod, ai, table) {
     parts.push(`*Subcategory:* ${escapeMd(ai.subcategory || '-')}`);
   }
 
-  // ✅ escape this too
   parts.push(`*Image:* ${escapeMd(prod.image ? 'Attached' : '-')}`);
   return parts.join('\n');
 }
@@ -654,7 +748,6 @@ bot.command('list', async (ctx) => {
 
   const table = ctx.session.table;
 
-  // pick columns + sort column per table
   const selectCols =
     table === TABLES.exclusive
       ? 'id,name,price,is_active,created_at'
@@ -718,8 +811,6 @@ bot.command('smartadd', (ctx) => {
   ctx.reply('Send the product text (can be messy). You may also attach a photo or include a URL.');
 });
 
-
-
 bot.command('toggle', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const id = (ctx.message.text.split(' ')[1] || '').trim();
@@ -737,7 +828,6 @@ bot.command('toggle', async (ctx) => {
   if (upErr) return ctx.reply(`❌ Toggle failed: ${upErr.message}`);
   ctx.reply(`Toggled id ${id} to ${!data.is_active ? '✅ active' : '⛔️ inactive'}.`);
 });
-
 
 /* --------------------- text router --------------------- */
 bot.on('text', async (ctx, next) => {
@@ -787,18 +877,14 @@ bot.on('text', async (ctx, next) => {
   }
 
   // smart add
-
-
   if (ctx.session.mode === 'smart' && ctx.session.await === 'blob') {
     ctx.session.smart = { text: ctx.message.text, photo: null, og: {}, prod: {} };
     const urls = findUrls(ctx.message.text);
-    if (urls.length) {
-      // fetch first OG as hint
-      ctx.session.smart.og = await getOG(urls[0]);
-    }
-    // try AI extraction/enrichment
+    if (urls.length) ctx.session.smart.og = await getOG(urls[0]);
+
     const rough = await extractFromFreeform(ctx.message.text);
     const enriched = await enrichWithAI(rough, ctx.message.text, ctx.session.smart.og);
+
     ctx.session.smart.prod = {
       name: enriched.name || rough.name,
       plan: enriched.plan !== 'unknown' ? enriched.plan : rough.plan,
@@ -806,104 +892,99 @@ bot.on('text', async (ctx, next) => {
       price: enriched.price || rough.price || null,
       description: enriched.description || rough.description || '',
       tags: uniqMerge(enriched.tags),
-      image: null
+      image: null,
+      og_image: ctx.session.smart.og?.image || null // ✅ pass OG image as potential reference (generation only)
     };
-    // ask for photo if not provided
     ctx.session.mode = 'smart-photo';
     return ctx.reply('If you have a product *image*, send it now. Or type "skip".', { parse_mode: 'Markdown' });
   }
 
   // gemini bulk continues...
- // gemini bulk continues...
-if (ctx.session.mode === 'gemini') {
-  if (ctx.session.stage === 'paste') {
-    await ctx.reply('⏳ Detecting products…');
-    const items = await extractManyFromFreeform(ctx.message.text);
-    if (!items.length) return ctx.reply('Could not detect products. Try again with one-per-line.', { parse_mode:'Markdown' });
+  if (ctx.session.mode === 'gemini') {
+    if (ctx.session.stage === 'paste') {
+      await ctx.reply('⏳ Detecting products…');
+      const items = await extractManyFromFreeform(ctx.message.text);
+      if (!items.length) return ctx.reply('Could not detect products. Try again with one-per-line.', { parse_mode:'Markdown' });
 
-    for (const it of items) {
-      const ai = await enrichWithAI(it, it._txt || ctx.message.text, {});
-      it._ai = ai;
-      it.name = ai.name || it.name;
-      it.description = ai.description || it.description;
-      it.price = it.price ?? (ai.price || null);
-      it.tags = uniqMerge(it.tags, ai.tags);
+      for (const it of items) {
+        const ai = await enrichWithAI(it, it._txt || ctx.message.text, {});
+        it._ai = ai;
+        it.name = ai.name || it.name;
+        it.description = ai.description || it.description;
+        it.price = it.price ?? (ai.price || null);
+        it.tags = uniqMerge(it.tags, ai.tags);
+      }
+
+      ctx.session.stage = 'step';
+      ctx.session.products = items;
+      ctx.session.index = 0;
+      ctx.session.await = null;
+      await ctx.reply(`Detected *${items.length}* item(s). I’ll ask for any missing fields.`, { parse_mode: 'Markdown' });
+      return handleBulkStep(ctx);
     }
 
-    ctx.session.stage = 'step';
-    ctx.session.products = items;
-    ctx.session.index = 0;
-    ctx.session.await = null;
-    await ctx.reply(`Detected *${items.length}* item(s). I’ll ask for any missing fields.`, { parse_mode: 'Markdown' });
+    if (ctx.session.stage === 'step' && ctx.session.await) {
+      const idx = ctx.session.index || 0;
+      const prod = ctx.session.products?.[idx];
+      if (!prod) return ctx.reply('No active item.');
 
-    // 👉 start the stepper now
-    return handleBulkStep(ctx);
-  }
+      const valRaw = ctx.message.text.trim();
+      const want = ctx.session.await;
 
-  // If we're waiting for a specific field for the current product, capture it first
-  if (ctx.session.stage === 'step' && ctx.session.await) {
-    const idx = ctx.session.index || 0;
-    const prod = ctx.session.products?.[idx];
-    if (!prod) return ctx.reply('No active item.');
-
-    const valRaw = ctx.message.text.trim();
-    const want = ctx.session.await;
-
-    if (want === 'price') {
-      prod.price = parsePrice(valRaw);
-      if (!prod.price) return ctx.reply('Enter a valid price (number).');
-      ctx.session.await = null;
-      return handleBulkStep(ctx);            // 👈 continue
-    } else if (want === 'originalPrice') {
-      prod.originalPrice = parsePrice(valRaw);
-      if (!prod.originalPrice) return ctx.reply('Enter a valid MRP (number).');
-      ctx.session.await = null;
-      return handleBulkStep(ctx);            // 👈 continue
-    } else if (want === 'stock') {
-      prod.stock = parsePrice(valRaw);
-      if (typeof prod.stock !== 'number') return ctx.reply('Enter a valid stock count (number).');
-      ctx.session.await = null;
-      return handleBulkStep(ctx);            // 👈 continue
-    } else if (want === 'image') {
-      if (/^generate$/i.test(valRaw)) {
-        try {
-          await ctx.reply('🎨 Generating image…');
-          const ai = prod._ai || await enrichWithAI(prod, prod._txt || '', {});
-          const url = await ensureImageForProduct({ ...prod, ...ai }, ctx.session.table, ctx.session.style || 'neo');
-          prod.image = url;
-          ctx.session.await = null;
-          return handleBulkStep(ctx);        // 👈 continue
-        } catch (e) {
-          console.error('bulk image generate failed:', e);
-          return ctx.reply('⚠️ Could not generate. Upload a photo or paste an image URL, or type "skip".');
-        }
-      } else if (/^skip$/i.test(valRaw)) {
-        prod.image = null;
+      if (want === 'price') {
+        prod.price = parsePrice(valRaw);
+        if (!prod.price) return ctx.reply('Enter a valid price (number).');
         ctx.session.await = null;
-        return handleBulkStep(ctx);          // 👈 continue
-      } else if (/^https?:\/\//i.test(valRaw)) {
-        try {
-          prod.image = await rehostToSupabase(valRaw, 'prod.jpg', ctx.session.table);
+        return handleBulkStep(ctx);
+      } else if (want === 'originalPrice') {
+        prod.originalPrice = parsePrice(valRaw);
+        if (!prod.originalPrice) return ctx.reply('Enter a valid MRP (number).');
+        ctx.session.await = null;
+        return handleBulkStep(ctx);
+      } else if (want === 'stock') {
+        prod.stock = parsePrice(valRaw);
+        if (typeof prod.stock !== 'number') return ctx.reply('Enter a valid stock count (number).');
+        ctx.session.await = null;
+        return handleBulkStep(ctx);
+      } else if (want === 'image') {
+        if (/^generate$/i.test(valRaw)) {
+          try {
+            await ctx.reply('🎨 Generating image…');
+            const ai = prod._ai || await enrichWithAI(prod, prod._txt || '', {});
+            const url = await ensureImageForProduct(
+              { ...prod, ...ai }, ctx.session.table, ctx.session.style || 'neo'
+            );
+            prod.image = url;
+            ctx.session.await = null;
+            return handleBulkStep(ctx);
+          } catch (e) {
+            console.error('bulk image generate failed:', e);
+            return ctx.reply('⚠️ Could not generate. Upload a photo or paste an image URL, or type "skip".');
+          }
+        } else if (/^skip$/i.test(valRaw)) {
+          prod.image = null;
           ctx.session.await = null;
-          return handleBulkStep(ctx);        // 👈 continue
-        } catch {
-          return ctx.reply('Could not fetch that URL. Upload a photo or type "generate" or "skip".');
+          return handleBulkStep(ctx);
+        } else if (/^https?:\/\//i.test(valRaw)) {
+          try {
+            prod.image = await rehostToSupabase(valRaw, 'prod.jpg', ctx.session.table);
+            ctx.session.await = null;
+            return handleBulkStep(ctx);
+          } catch {
+            return ctx.reply('Could not fetch that URL. Upload a photo or type "generate" or "skip".');
+          }
+        } else {
+          return ctx.reply('Upload a photo, paste an image URL, type "generate", or "skip".');
         }
-      } else {
-        return ctx.reply('Upload a photo, paste an image URL, type "generate", or "skip".');
       }
     }
+
+    if (!ctx.session.review) {
+      return handleBulkStep(ctx);
+    }
   }
 
-  // If we’re in gemini mode but not awaiting a field, drive the flow
-  if (!ctx.session.review) {
-  return handleBulkStep(ctx);
-}          
-}
-
-
-
-  // inline edit handler text (applies for /update too)
+  // inline edit handler text
   if (ctx.session.awaitEdit) {
     await applyInlineEdit(ctx);
     return;
@@ -912,11 +993,10 @@ if (ctx.session.mode === 'gemini') {
   return next();
 });
 
-/* --------------------- photo handlers --------------------- */
+/* --------------------- photo handlers (unchanged upload flow) --------------------- */
 bot.on('photo', async (ctx) => {
   if (!isAdmin(ctx)) return;
 
-  // get the largest photo's fileId once
   const photos = ctx.message?.photo || [];
   const fileId = photos.at(-1)?.file_id;
   if (!fileId) return;
@@ -924,7 +1004,7 @@ bot.on('photo', async (ctx) => {
   const fileLink = await ctx.telegram.getFileLink(fileId);
   const href = typeof fileLink === 'string' ? fileLink : fileLink.href;
 
-  /* --- EDIT MODE: user tapped "image" and uploaded a new photo --- */
+  // EDIT MODE image
   if (ctx.session.awaitEdit === 'image' && ctx.session.review) {
     try {
       const { table } = ctx.session.review;
@@ -940,7 +1020,7 @@ bot.on('photo', async (ctx) => {
     return;
   }
 
-  // --- manual wizard photo ---
+  // manual wizard photo
   if (ctx.session.mode === 'manual-photo') {
     const imgUrl = await rehostToSupabase(href, 'prod.jpg', ctx.session.table);
     const prod = ctx.session.form.prod;
@@ -951,7 +1031,7 @@ bot.on('photo', async (ctx) => {
     return ctx.replyWithMarkdownV2(reviewMessage(prod, ai, ctx.session.table), kbConfirm);
   }
 
-  // --- smart add photo ---
+  // smart add photo
   if (ctx.session.mode === 'smart-photo') {
     ctx.session.smart.photo = await rehostToSupabase(href, 'prod.jpg', ctx.session.table);
 
@@ -963,7 +1043,7 @@ bot.on('photo', async (ctx) => {
     return ctx.replyWithMarkdownV2(reviewMessage(ctx.session.review.prod, ai, ctx.session.table), kbConfirm);
   }
 
-  // --- BULK: waiting for an image ---
+  // BULK photo waiting
   if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && ctx.session.await === 'image') {
     try {
       const imgUrl = await rehostToSupabase(href, 'prod.jpg', ctx.session.table);
@@ -978,19 +1058,15 @@ bot.on('photo', async (ctx) => {
   }
 });
 
-
 /* If smart add user types "skip" instead of photo -> ask to generate */
 bot.hears(/^skip$/i, async (ctx) => {
   if (!isAdmin(ctx)) return;
   if (ctx.session.mode === 'smart-photo') {
-    // store what we have; ask if they want AI image
     const prod = { ...ctx.session.smart.prod, image: null };
-    ctx.session.smart.prod = prod;  // keep it
+    ctx.session.smart.prod = prod;
     await ctx.reply('No image provided. Do you want me to generate a product image for you?', kbGenImage);
   }
 });
-
-
 
 /* --------------------- callbacks --------------------- */
 bot.action('cancel', (ctx) => {
@@ -1005,12 +1081,9 @@ bot.action('save', async (ctx) => {
   ctx.answerCbQuery('Saving…');
 
   const { prod, ai, table, updateId } = ctx.session.review;
-
-  // common payload builders
   const baseTags = uniqMerge(prod.tags, ai.tags);
 
   if (updateId) {
-    // UPDATE existing
     if (table === TABLES.products) {
       const payload = {
         name: prod.name,
@@ -1050,15 +1123,12 @@ bot.action('save', async (ctx) => {
         await ctx.reply('What next?', kbAfterTask());
       }
     }
-        ctx.session.review = null;
-    // if we are in bulk mode, continue to next product
+    ctx.session.review = null;
     if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && Array.isArray(ctx.session.products)) {
       return handleBulkStep(ctx);
     }
-    // otherwise end the flow
     ctx.session.mode = null;
     return;
-
   }
 
   // INSERT new (dupe guard)
@@ -1118,7 +1188,7 @@ bot.action('save', async (ctx) => {
     }
   }
 
-   ctx.session.review = null;
+  ctx.session.review = null;
   if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && Array.isArray(ctx.session.products)) {
     return handleBulkStep(ctx);
   }
@@ -1167,6 +1237,8 @@ bot.action('gen_img_yes', async (ctx) => {
 
     // enrich first for a richer prompt
     const ai = await enrichWithAI(prodBase, ctx.session.smart.text, ctx.session.smart.og);
+
+    // include OG image as ref for generation only
     const prodForPrompt = { ...prodBase, ...ai, category: normalizeCategory({ ...prodBase, ...ai }, ai.category) };
 
     const url = await ensureImageForProduct(prodForPrompt, table, ctx.session.style || 'neo');
@@ -1199,7 +1271,6 @@ bot.action('gen_img', async (ctx) => {
 
   try {
     const url = await ensureImageForProduct(base, table, ctx.session.style || 'neo');
-    // attach to the current product in session
     if (ctx.session.review?.prod) ctx.session.review.prod.image = url;
     if (ctx.session.smart?.prod) ctx.session.smart.prod.image = url;
 
@@ -1253,10 +1324,8 @@ async function applyInlineEdit(ctx) {
   }
 
   if (field === 'image' && /^https?:\/\//i.test(val)) {
-    // allow pasting a direct URL (route to the correct bucket by table)
     prod.image = await rehostToSupabase(val, 'prod.jpg', rvw.table);
   } else if (field === 'category') {
-    // clamp typed value to one of the 4 allowed categories
     ai.category = normalizeCategory({ ...prod, ...ai }, val);
   } else if (['name','plan','validity','price','description','originalPrice','stock'].includes(field)) {
     prod[field] = val;
@@ -1303,12 +1372,10 @@ async function handleBulkStep(ctx) {
 
   const prod = items[idx];
 
-  // ensure AI enrich present
   if (!prod._ai) {
     prod._ai = await enrichWithAI(prod, prod._txt || '', {});
   }
 
-  // ask for missing fields
   if (!ok(prod.price)) {
     ctx.session.await = 'price';
     return ctx.reply(`Enter *price* for "${prod.name}"`, { parse_mode: 'Markdown' });
@@ -1326,15 +1393,12 @@ async function handleBulkStep(ctx) {
     return ctx.reply(`Upload *image* for "${prod.name}" (or type "generate" / "skip" / paste URL)`, { parse_mode: 'Markdown' });
   }
 
-  // ready to review this item
   ctx.session.review = { prod, ai: prod._ai, table };
   await ctx.replyWithMarkdownV2(reviewMessage(prod, prod._ai, table), kbConfirm);
 
-  // advance index so after Save we move to the next
   ctx.session.index = idx + 1;
   ctx.session.await = null;
 }
-
 
 /* --------------------- errors & launch --------------------- */
 bot.catch((err, ctx) => {
