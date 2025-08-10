@@ -1471,31 +1471,43 @@ bot.action('save', async (ctx) => {
   const baseTags = uniqMerge(prod.tags, ai.tags);
 
    if (updateId) {
-  // ensure hosted (no-op for your Supabase URL)
+  // 0) if user pasted an external URL, rehost into your bucket (no-op for Supabase public URL)
   if (prod.image && /^https?:\/\//i.test(prod.image) && !isSupabasePublicUrl(prod.image)) {
     try { prod.image = await ensureHostedInSupabase(prod.image, table); } catch {}
   }
 
   const isProducts = table === TABLES.products;
 
-  // which column exists?
-  let imgCol = isProducts ? 'image' : 'image_url';
-  try {
-    const { data: probe } = await supabase
-      .from(table)
-      .select(isProducts ? 'id,image,image_url' : 'id,image_url')
-      .eq('id', updateId).maybeSingle();
-    if (isProducts && probe && typeof probe.image === 'undefined' && typeof probe.image_url !== 'undefined') {
-      imgCol = 'image_url';
-    }
-  } catch {}
+  // 1) Preflight: fetch the row to discover the real image column name
+  const { data: row, error: preErr } = await supabase
+    .from(table)
+    .select('*')
+    .eq('id', updateId)
+    .maybeSingle();
 
-  // 1) minimal update: only the image column
-  let { data: after, error: upErr } = await supabase
+  if (preErr || !row) {
+    await ctx.reply(`❌ Can't load row ${updateId}: ${preErr?.message || 'not found'}`);
+    return;
+  }
+
+  // choose which column to write
+  let imgCol = null;
+  if ('image' in row) imgCol = 'image';
+  else if ('image_url' in row) imgCol = 'image_url';
+
+  if (!imgCol) {
+    console.log('[image:update] no image column on row keys =', Object.keys(row));
+    await ctx.reply('⚠️ I cannot find an `image`/`image_url` column in this table. ' +
+                    'Open your Supabase table and create a text column named `image` (or `image_url`).');
+    return;
+  }
+
+  // 2) Write just that column
+  const { data: updated, error: upErr } = await supabase
     .from(table)
     .update({ [imgCol]: prod.image || null })
     .eq('id', updateId)
-    .select(isProducts ? `id,${imgCol}` : 'id,image_url')
+    .select(`id, ${imgCol}`)
     .maybeSingle();
 
   if (upErr) {
@@ -1503,27 +1515,9 @@ bot.action('save', async (ctx) => {
     return;
   }
 
-  // 2) if value didn't change, try the alternate column name (safety net)
-  const savedNow = after?.[imgCol];
-  if (savedNow !== prod.image && isProducts) {
-    const altCol = imgCol === 'image' ? 'image_url' : 'image';
-    const { data: afterAlt, error: e2 } = await supabase
-      .from(table)
-      .update({ [altCol]: prod.image || null })
-      .eq('id', updateId)
-      .select(`id,${altCol}`)
-      .maybeSingle();
-    console.log('[save:image] retry on altCol=', altCol, '->', afterAlt?.[altCol], e2 || '');
-  }
+  console.log('[image:update] wrote', imgCol, '->', updated?.[imgCol]);
 
-  // final check + log
-  const { data: check } = await supabase
-    .from(table)
-    .select(isProducts ? `id,image,image_url` : 'id,image_url')
-    .eq('id', updateId).maybeSingle();
-
-  console.log('[post-save:final]', table, updateId, 'image=', check?.image, 'image_url=', check?.image_url);
-
+  // 3) Done
   await ctx.reply(escapeMd(`✅ Updated ${table}`), { parse_mode: 'MarkdownV2' });
   await ctx.reply('What next?', kbAfterTask());
 
