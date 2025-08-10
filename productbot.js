@@ -3,6 +3,8 @@ const { Telegraf, session, Markup } = require('telegraf');
 const { createClient } = require('@supabase/supabase-js');
 const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
 const { GoogleGenerativeAI } = require('@google/generative-ai'); // ✅ keep
+const OpenAI = require('openai');
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const ADMIN_IDS = (process.env.ADMIN_IDS || '7057639075')
   .split(',').map(s => Number(s.trim())).filter(Boolean);
@@ -32,7 +34,8 @@ const toStr = (v) => {
 const TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-flash';
 const DEFAULT_IMAGE_MODEL =
   (process.env.GEMINI_IMAGE_MODEL && process.env.GEMINI_IMAGE_MODEL.trim()) ||
-  'gemini-2.0-flash-exp';
+  'gemini-2.0-flash-preview-image-generation';
+
 
 // Escape MarkdownV2 for Telegram safely
 const escapeMd = (v = '') => toStr(v).replace(/([_\*\[\]\(\)~`>#+\-=|{}\.!])/g, '\\$1');
@@ -545,42 +548,85 @@ Negative: placeholder blobs, tiny/cropped text, extra logos, heavy glare, border
 
 
 
+async function generateImageOpenAI({ prompt, size = '1024x1024' }) {
+  const out = await openai.images.generate({
+    model: process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1',
+    prompt,
+    size,
+  });
+  const b64 = out.data[0].b64_json;
+  return Buffer.from(b64, 'base64'); // PNG buffer
+}
+
+function bgOnlyPromptFrom(prompt) {
+  return `${prompt}
+
+IMPORTANT:
+- Produce ONLY a clean, aesthetic background (gradients, subtle glow, light effects).
+- Do NOT include any text, symbols, icons, watermarks, or logos.`;
+}
+
+async function generateBackgroundWithOpenAI(prompt) {
+  const res = await openai.images.generate({
+    model: process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1',
+    prompt: bgOnlyPromptFrom(prompt),
+    size: '1024x1024',
+    n: 1
+  });
+  const b64 = res.data?.[0]?.b64_json;
+  if (!b64) throw new Error('OpenAI returned no background');
+  return Buffer.from(b64, 'base64');
+}
+
 
 // Accept refs and build parts accordingly
-async function generateProductImageBytes({ prompt, refImages = [] }) {
-  const candidates = Array.from(new Set([
-    DEFAULT_IMAGE_MODEL,
-    'gemini-2.0-flash-exp',
-    'gemini-2.0-flash'
-  ]));
-  let lastErr;
+async function generateProductImageBytes({ prompt, refImages = [], brandName }) {
+  const backend = (process.env.IMG_BACKEND || '').toLowerCase();
 
-  const parts = [];
-  for (const r of (refImages || []).slice(0,3)) {
-    if (r?.b64) parts.push({ inlineData: { data: r.b64, mimeType: r.mime || 'image/jpeg' } });
+  if (backend === 'openai') {
+    return generateImageOpenAI({ prompt });
   }
-  parts.push({ text: prompt });
 
+  if (backend === 'openai-bg') {
+    const bgBuf = await generateBackgroundWithOpenAI(prompt);
+    const logoRef = refImages?.[0];
+    if (!logoRef?.b64) throw new Error('No logo reference available for openai-bg');
+    return composeTileWithLogo({ bgBuf, logoRef, brandName });
+  }
+
+  const candidates = [...new Set([
+    DEFAULT_IMAGE_MODEL,
+    'gemini-2.0-flash-preview-image-generation',
+    'gemini-2.0-flash-exp',
+    'gemini-2.0-flash',
+  ])];
+
+  const parts = [
+    ...refImages.slice(0,3).filter(r => r?.b64)
+      .map(r => ({ inlineData: { data: r.b64, mimeType: r.mime || 'image/jpeg' } })),
+    { text: prompt }
+  ];
+
+  let lastErr;
   for (const id of candidates) {
     try {
       const model = genAI.getGenerativeModel({ model: id });
       const res = await model.generateContent({
-  contents: [{ role: 'user', parts }],
-  generationConfig: { temperature: 0.2, responseModalities: ['TEXT','IMAGE'] },
-});
+        contents: [{ role: 'user', parts }],
+        generationConfig: { temperature: 0.2, responseModalities: ['TEXT','IMAGE'] },
+      });
       const prts = res.response?.candidates?.[0]?.content?.parts ?? [];
-      const imagePart = prts.find(p => p.inlineData && p.inlineData.data);
+      const imagePart = prts.find(p => p.inlineData?.data);
       if (!imagePart) throw new Error('No inline image returned');
       return Buffer.from(imagePart.inlineData.data, 'base64');
     } catch (e) {
       lastErr = e;
-      console.warn(`Image model "${id}" failed:`, e?.message || e);
+      console.warn(`[gen] ${id} failed:`, e?.message || e);
     }
   }
-  const err = new Error('All image models failed');
-  err.cause = lastErr;
-  throw err;
+  throw Object.assign(new Error('All image models failed'), { cause: lastErr });
 }
+
 
 async function uploadImageBufferToSupabase(
   buf,
@@ -718,6 +764,49 @@ async function fetchBrandRefs(name) {
   return blobs;
 }
 
+async function composeTileWithLogo({ bgBuf, logoRef, brandName }) {
+  if (!_sharp) throw new Error('sharp not available');
+
+  // decode logo
+  const logoBuf = Buffer.from(logoRef.b64, 'base64');
+
+  // scale logo to ~55% width, auto height, centered
+  const canvas = await _sharp(bgBuf)
+    .resize(1024, 1024, { fit: 'cover' })
+    .toBuffer();
+
+  const logoPng = await _sharp(logoBuf)
+    .resize({ width: 560, withoutEnlargement: true }) // ~55%
+    .png()
+    .toBuffer();
+
+  // brand name SVG (big, readable, within 10% padding)
+  const safe = (s='').replace(/[<&>]/g,c=>({ '<':'&lt;','>':'&gt;','&':'&amp;' }[c]));
+  const title = safe(brandName || 'Product').slice(0,48);
+  const textSvg = Buffer.from(`
+    <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="300">
+      <style>
+        .t{ font-family: "Inter","Segoe UI",Roboto,Arial; font-weight: 800; }
+      </style>
+      <text x="512" y="230" text-anchor="middle" class="t" font-size="96" fill="#fff">${title}</text>
+    </svg>
+  `);
+
+  // compose: logo centered vertically at 420px, text near bottom
+  const composed = await _sharp(canvas)
+    .composite([
+      { input: logoPng, top: 260, left: Math.round((1024-560)/2) },
+      { input: textSvg, top: 724, left: 0 }
+    ])
+    .png()
+    .toBuffer();
+
+  // watermark (your existing helper)
+  const withWm = await addWatermarkToBuffer(composed, 'Harshportal') || composed;
+  return withWm;
+}
+
+
 
 
 
@@ -827,17 +916,21 @@ async function ensureImageForProduct(prod, table, style = 'neo') {
   // 1) Brand-true logo tile (with name)
   try {
     const prompt = await buildImagePrompt(prod, style, !_sharp /* ask prompt to add watermark only if sharp missing */);
-    let buf = await generateProductImageBytes({ prompt, refImages: refBlobs });
+     const brandName = shortBrandName(prod);         
+  let buf = await generateProductImageBytes({     
+    refImages: refBlobs,
+    brandName
+  });
 
     // Prefer server watermark (consistent & always visible)
-    if (_sharp) {
-      const wm = await addWatermarkToBuffer(buf, 'Harshportal');
-      if (wm) buf = wm;
-    }
-    return await uploadImageBufferToSupabase(buf, { table, filename: 'ai.png', contentType: 'image/png' });
-  } catch (e) {
-    console.warn('brand tile generation failed:', e?.message || e);
+      if (_sharp) {
+    const wm = await addWatermarkToBuffer(buf, 'Harshportal');
+    if (wm) buf = wm;
   }
+  return await uploadImageBufferToSupabase(buf, { table, filename: 'ai.png', contentType: 'image/png' });
+} catch (e) {
+  console.warn('brand tile generation failed:', e?.message || e);
+}
 
   // 2) Guaranteed fallback: big readable title SVG (brand colors) + watermark baked in SVG
   const svg = makeTextCardSvg(prod?.name || 'Digital Product', prod?.plan || prod?.subcategory || '');
@@ -1254,6 +1347,7 @@ async function processIncomingImage(ctx, fileId, filenameHint = 'prod.jpg') {
     return;
   }
 
+
   // 4) GEMINI BULK: waiting for an image for current item
   if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && ctx.session.await === 'image') {
     try {
@@ -1636,4 +1730,6 @@ bot.catch((err, ctx) => {
 
 bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
 bot.launch();
+console.log('[img] backend:', backend);
 console.log('🚀 Product Bot running with /smartadd and /update');
+
