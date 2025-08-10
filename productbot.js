@@ -35,6 +35,11 @@ const toStr = (v) => {
 const TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-flash';
 const textModel = genAI.getGenerativeModel({ model: TEXT_MODEL });
 
+const DEFAULT_IMAGE_MODEL =
+  (process.env.GEMINI_IMAGE_MODEL && process.env.GEMINI_IMAGE_MODEL.trim()) ||
+  'gemini-2.0-flash-exp';
+
+
 // Escape MarkdownV2 for Telegram safely
 const escapeMd = (v = '') => toStr(v).replace(/([_\*\[\]\(\)~`>#+\-=|{}\.!])/g, '\\$1');
 
@@ -323,28 +328,36 @@ ${text}
 
 /* ---------------- Gemini 2.0 Flash Preview image gen + Supabase upload ---------------- */
 // Replace your whole generateProductImageBytes() with this version
+// --- replace the whole function ---
 async function generateProductImageBytes(prompt) {
-  const modelName = process.env.GEMINI_IMAGE_MODEL || 'gemini-2.0-flash-preview-image-generation';
-  const model = genAI.getGenerativeModel({ model: modelName });
+  const candidates = Array.from(new Set([
+    DEFAULT_IMAGE_MODEL,           // env or default 'gemini-2.0-flash-exp'
+    'gemini-2.0-flash-exp',
+    'gemini-2.0-flash'
+  ]));
 
-  // Ask the model to return an IMAGE (it will also return short TEXT metadata)
-  const res = await model.generateContent({
-    contents: [{ role: 'user', parts: [{ text: prompt }]}],
-    generationConfig: {
-      responseModalities: ['TEXT', 'IMAGE'],
-    },
-  });
-
-  // Grab the first inline image
-  const parts = res.response?.candidates?.[0]?.content?.parts ?? [];
-  const imagePart = parts.find(p => p.inlineData && p.inlineData.data);
-  if (!imagePart) {
-    throw new Error('No image returned by the image model');
+  let lastErr;
+  for (const id of candidates) {
+    try {
+      const model = genAI.getGenerativeModel({ model: id });
+      const res = await model.generateContent({
+        contents: [{ role: 'user', parts: [{ text: prompt }]}],
+        generationConfig: { responseModalities: ['TEXT', 'IMAGE'] },
+      });
+      const parts = res.response?.candidates?.[0]?.content?.parts ?? [];
+      const imagePart = parts.find(p => p.inlineData && p.inlineData.data);
+      if (!imagePart) throw new Error('No inline image returned');
+      return Buffer.from(imagePart.inlineData.data, 'base64');
+    } catch (e) {
+      lastErr = e;
+      console.warn(`Image model "${id}" failed:`, e?.message || e);
+    }
   }
-
-  // inlineData is base64; convert to a Buffer
-  return Buffer.from(imagePart.inlineData.data, 'base64');
+  const err = new Error('All image models failed');
+  err.cause = lastErr;
+  throw err;
 }
+
 
 async function uploadImageBufferToSupabase(
   buf,
@@ -369,19 +382,58 @@ async function uploadImageBufferToSupabase(
   return pub.publicUrl;
 }
 
+function makeTextCardSvg(title = 'Product', subtitle = '') {
+  const brand = getBrandStyle?.({ name: title }) || null;
+  const [c1, c2] = (brand?.palette && brand.palette.length >= 2)
+    ? brand.palette.slice(0, 2)
+    : ['#0ea5e9','#7c3aed'];
+
+  const esc = s => String(s || '').replace(/[<&>]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+  const t = esc(title).slice(0, 42);
+  const sub = esc(subtitle).slice(0, 60);
+
+  return `
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024">
+  <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="${c1}"/><stop offset="100%" stop-color="${c2}"/>
+  </linearGradient></defs>
+  <rect width="1024" height="1024" fill="url(#g)"/>
+  <circle cx="512" cy="512" r="380" fill="rgba(0,0,0,0.18)"/>
+  <text x="50%" y="50%" fill="#fff" font-family="Segoe UI, Roboto, Arial" font-size="80" font-weight="700"
+        text-anchor="middle" dominant-baseline="central">${t}</text>
+  ${sub ? `<text x="50%" y="60%" fill="rgba(255,255,255,0.92)" font-family="Segoe UI, Roboto, Arial"
+        font-size="42" text-anchor="middle">${sub}</text>` : ''}
+</svg>`.trim();
+}
+
+
 /** Convenience: try brand-adjacent, then force big text fallback */
+// --- replace your ensureImageForProduct with this ---
 async function ensureImageForProduct(prod, table, style = 'neo') {
+  // try brand-adjacent (no text)
   try {
     const p1 = await buildImagePrompt(prod, style, false);
     const b1 = await generateProductImageBytes(p1);
     return await uploadImageBufferToSupabase(b1, { table, filename: 'ai.png', contentType: 'image/png' });
   } catch (e) {
-    console.warn('Image gen try #1 failed; falling back to text:', e?.message || e);
+    console.warn('Image gen try #1 failed; will try with text:', e?.message || e);
   }
-  const p2 = await buildImagePrompt(prod, style, true);
-  const b2 = await generateProductImageBytes(p2);
-  return uploadImageBufferToSupabase(b2, { table, filename: 'ai.png', contentType: 'image/png' });
+
+  // try with large product text
+  try {
+    const p2 = await buildImagePrompt(prod, style, true);
+    const b2 = await generateProductImageBytes(p2);
+    return await uploadImageBufferToSupabase(b2, { table, filename: 'ai.png', contentType: 'image/png' });
+  } catch (e) {
+    console.warn('Image gen try #2 failed; falling back to SVG text card:', e?.message || e);
+  }
+
+  // final fallback: SVG text card (always works)
+  const svg = makeTextCardSvg(prod?.name || 'Digital Product', prod?.plan || prod?.subcategory || '');
+  const svgBuf = Buffer.from(svg, 'utf8');
+  return uploadImageBufferToSupabase(svgBuf, { table, filename: 'ai.svg', contentType: 'image/svg+xml' });
 }
+
 
 /* ---------- AI image generation (brand-adjacent + optional text) ---------- */
 const BRAND_HINTS = [
