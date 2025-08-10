@@ -225,20 +225,25 @@ async function fetchAsBase64(url) {
 // optional watermark with sharp; fall back to prompt watermark
 let _sharp = null;
 try { _sharp = require('sharp'); } catch {}
+
 async function addWatermarkToBuffer(buf, text = 'Harshportal') {
-  if (!_sharp) return null; // signal: do prompt watermark instead
+  if (!_sharp) return null; // fall back to prompt-watermark elsewhere
   const svg = Buffer.from(`
-  <svg xmlns="http://www.w3.org/2000/svg" width="800" height="200">
-    <style>
-      .w{font-family: Segoe UI, Roboto, Arial; font-size:72px; font-weight:700; fill:#ffffff; opacity:.18;}
-    </style>
-    <text x="100%" y="80%" text-anchor="end" class="w">${text}</text>
+  <svg xmlns="http://www.w3.org/2000/svg" width="900" height="240">
+    <text x="98%" y="80%"
+      font-family="Segoe UI, Roboto, Arial"
+      font-size="88" font-weight="800"
+      text-anchor="end"
+      fill="#ffffff" opacity=".28"
+      stroke="#000000" stroke-opacity=".25" stroke-width="2"
+      transform="rotate(-8 800 180)">${text}</text>
   </svg>`);
   return await _sharp(buf)
     .composite([{ input: svg, gravity: 'southeast', blend: 'over' }])
     .png()
     .toBuffer();
 }
+
 
 /* ---------------- AI enrichment (unchanged logic) ---------------- */
 async function enrichWithAI(prod, textHints = '', ogHints = {}) {
@@ -422,28 +427,19 @@ Text:
 async function buildImagePrompt(prod, styleName = 'neo', forceText = false, wantPromptWatermark = false) {
   const model = genAI.getGenerativeModel({ model: TEXT_MODEL });
   const themeText = STYLE_THEMES[styleName] || STYLE_THEMES.neo;
-
   const brand = getBrandStyle(prod);
   const brandName = brand?.name || (prod?.category || 'Digital product');
-  const palette = brand?.palette?.join(', ') || 'teal, cyan, indigo on dark';
-  const brandHints = brand?.keywords || 'clean geometric packshot cues';
+  const palette = brand?.palette?.join(', ') || 'brand-accurate colors';
+  const brandHints = brand?.keywords || 'replicate official logomark shape/proportions';
 
   const sys = `
-You will write a single, precise prompt for an image model that may also receive 0..3 reference images.
-Goal: photoreal/hyperreal **packshot** that matches the *actual product* **80–99%** (shape, color, materials, iconography).
-Square 1:1. Clean studio background (subtle gradient ok). No borders. No watermarks unless requested.
-If "includeText" is true, render large clean title text; otherwise **no text**.`;
+Write a single, precise prompt for an image model that may also receive up to 3 reference images.
+Goal: a clean 1:1 **packshot** that matches the *real product/brand* **80–99%** (exact logo shape, colors, icon proportions).
+Use references as ground truth. No borders. No watermarks unless requested.`;
 
   const user = `
 Product:
-${JSON.stringify({
-  name: prod?.name,
-  plan: prod?.plan,
-  validity: prod?.validity,
-  category: prod?.category,
-  subcategory: prod?.subcategory,
-  tags: prod?.tags
-})}
+${JSON.stringify({ name: prod?.name, category: prod?.category, subcategory: prod?.subcategory, tags: prod?.tags })}
 
 Brand/context: ${brandName}
 Palette: ${palette}
@@ -451,22 +447,20 @@ Motifs: ${brandHints}
 Theme: ${themeText}
 
 Composition:
-- centered hero packshot; crisp edges; accurate proportions and true colors
-- match any provided reference images **80–99%** (treat them as ground truth)
-- avoid generic repeated gradient circles; vary style per product
-- background may be subtle studio/brand gradient, not busy
+- centered hero card; crisp edges; **replicate official logomark**, not a generic gradient
+- background: subtle studio or brand gradient (not busy)
+- if references show a specific glyph (e.g., Spotify wave circle), copy its silhouette and proportions
+- ${forceText ? `include large, readable title text: "${prod?.name || brandName}"` : 'no text'}
 
-${forceText ? `includeText: true (big, legible): "${prod?.name || brandName}"` : 'includeText: false'}
-${wantPromptWatermark ? 'Add a tiny, subtle corner watermark text: "Harshportal".' : ''}
+${wantPromptWatermark ? 'Add a small corner text watermark: "Harshportal".' : ''}
 
-Negative: busy/noisy patterns, heavy glare, unreadable tiny text, extra logos, watermarks (unless requested), borders.`;
+Negative: generic placeholder circles, tiny unreadable text, heavy glare, extra logos, borders.`;
 
   try {
     const out = await model.generateContent([{ role: 'user', parts: [{ text: sys + '\n' + user }]}]);
     return out.response.text().trim().replace(/\s+/g, ' ');
   } catch {
-    // safe fallback
-    return `Photoreal packshot of ${prod?.name || brandName}, square 1:1, ${themeText}, colors ${palette}, match real product 80–99%, ${forceText ? `with big readable "${prod?.name || brandName}" text` : 'no text'}, clean studio background.`;
+    return `1:1 packshot of ${prod?.name || brandName}, replicate official logo shape/colors, ${themeText}, match references 80–99%, ${forceText ? `with big "${prod?.name || brandName}" text` : 'no text'}, clean studio background.`;
   }
 }
 
@@ -533,29 +527,44 @@ async function uploadImageBufferToSupabase(
 /* Title SVG (bigger, auto-scales) */
 function makeTextCardSvg(title = 'Product', subtitle = '') {
   const brand = getBrandStyle?.({ name: title }) || null;
-  const [c1, c2] = (brand?.palette && brand.palette.length >= 2)
+  const [c1, c2] = (brand?.palette?.length >= 2)
     ? brand.palette.slice(0, 2)
-    : ['#0ea5e9','#7c3aed'];
+    : ['#0ea5e9', '#7c3aed'];
 
   const esc = s => String(s || '').replace(/[<&>]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
-  const t = esc(title).slice(0, 42);
+  const tRaw = (title || '').trim();
+  const t = esc(tRaw).slice(0, 42);
   const sub = esc(subtitle).slice(0, 60);
+
+  // dynamic font size so it’s always big on the card
+  const len = tRaw.length || 1;
+  const size = Math.max(84, Math.min(150, 150 - Math.max(0, len - 12) * 3));
 
   return `
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024">
-  <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-    <stop offset="0%" stop-color="${c1}"/><stop offset="100%" stop-color="${c2}"/>
-  </linearGradient></defs>
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="${c1}"/><stop offset="100%" stop-color="${c2}"/>
+    </linearGradient>
+  </defs>
   <rect width="1024" height="1024" fill="url(#g)"/>
-  <circle cx="512" cy="512" r="360" fill="rgba(0,0,0,0.18)"/>
-  <text x="50%" y="50%" fill="#fff" font-family="Segoe UI, Roboto, Arial" font-size="110" font-weight="800"
-        text-anchor="middle" dominant-baseline="central">${t}</text>
-  ${sub ? `<text x="50%" y="62%" fill="rgba(255,255,255,0.92)" font-family="Segoe UI, Roboto, Arial"
-        font-size="46" text-anchor="middle">${sub}</text>` : ''}
-  <text x="96%" y="96%" fill="rgba(255,255,255,0.22)" font-family="Segoe UI, Roboto, Arial"
-        font-size="40" text-anchor="end">Harshportal</text>
+  <!-- subtle vignette to add depth, different from old circle -->
+  <radialGradient id="v" cx="50%" cy="40%" r="60%">
+    <stop offset="0%" stop-color="rgba(0,0,0,0.10)"/>
+    <stop offset="100%" stop-color="rgba(0,0,0,0)"/>
+  </radialGradient>
+  <rect width="1024" height="1024" fill="url(#v)"/>
+  <text x="50%" y="52%" fill="#fff" font-family="Segoe UI, Roboto, Arial"
+        font-size="${size}" font-weight="900" text-anchor="middle"
+        dominant-baseline="central" letter-spacing="0.5px">${t}</text>
+  ${sub ? `<text x="50%" y="64%" fill="rgba(255,255,255,0.92)" font-family="Segoe UI, Roboto, Arial"
+        font-size="48" text-anchor="middle">${sub}</text>` : ''}
+  <text x="96%" y="96%" fill="rgba(255,255,255,0.28)" font-family="Segoe UI, Roboto, Arial"
+        font-size="40" text-anchor="end" stroke="#000" stroke-opacity=".25" stroke-width="2"
+        transform="rotate(-8 900 900)">Harshportal</text>
 </svg>`.trim();
 }
+
 
 /** MAIN: generate image for a product with ref-match + watermark
  *  Priority inside generation:
@@ -563,6 +572,63 @@ function makeTextCardSvg(title = 'Product', subtitle = '') {
  *   2) Title image (big readable text), brand/vibe matched, watermark
  *   3) SVG fallback (always works), watermark baked
  */
+
+// --- map common products to their real domains (extend anytime) ---
+const BRAND_DOMAIN_MAP = {
+  'spotify': 'spotify.com',
+  'netflix': 'netflix.com',
+  'youtube': 'youtube.com',
+  'yt premium': 'youtube.com',
+  'disney': 'disneyplus.com',
+  'prime video': 'primevideo.com', 'prime': 'primevideo.com',
+  'descript': 'descript.com',
+  'mobbin': 'mobbin.com',
+  'raycast': 'raycast.com',
+  'warp': 'warp.dev',
+  'bolt.new': 'bolt.new', 'boltnew': 'bolt.new',
+  'lovable': 'lovable.dev', 'lovable.dev': 'lovable.dev',
+  'gamma': 'gamma.app',
+  'n8n': 'n8n.io',
+  'magic patterns': 'magicpatterns.design',
+  'wispr': 'wispr.cc', 'wispr flow': 'wispr.cc',
+  'windows': 'microsoft.com', 'windows 10': 'microsoft.com', 'windows 11': 'microsoft.com'
+};
+
+function resolveBrandDomain(name = '') {
+  const n = String(name).toLowerCase().trim();
+  for (const k of Object.keys(BRAND_DOMAIN_MAP)) {
+    if (n.includes(k)) return BRAND_DOMAIN_MAP[k];
+  }
+  // heuristic: strip spaces/punct → .com
+  const slug = n.replace(/[^a-z0-9]/g,'');
+  if (slug.length >= 3) return `${slug}.com`;
+  return null;
+}
+
+// pull high-confidence refs: Clearbit logo + homepage OG + unavatar (best-effort)
+async function fetchBrandRefs(name) {
+  const refs = [];
+  const domain = resolveBrandDomain(name);
+  if (domain) {
+    refs.push(`https://logo.clearbit.com/${domain}?size=512`);
+    try {
+      const og = await getOG(`https://${domain}`);
+      if (og?.image) refs.push(og.image);
+    } catch {}
+    refs.push(`https://unavatar.io/${domain}`);
+  }
+  // dedupe → fetch as base64
+  const uniq = Array.from(new Set(refs.filter(Boolean))).slice(0, 3);
+  const blobs = [];
+  for (const u of uniq) {
+    const b = await fetchAsBase64(u).catch(() => null);
+    if (b) blobs.push(b);
+  }
+  return blobs;
+}
+
+
+
 
 // --- Search the web for product name and get up to 3 image refs ---
 async function webSearchRefs(productName) {
@@ -605,51 +671,42 @@ async function webSearchRefs(productName) {
 
 
 async function ensureImageForProduct(prod, table, style = 'neo') {
-  // if a manual/upload image already exists, don't generate
+  // respect manual/uploaded image
   if (prod?.image && String(prod.image).trim()) return prod.image;
 
-  // collect up to 3 web refs by name + include OG if you already found one
-  const refBlobs = [
-    ...(await webSearchRefs(prod?.name || prod?.title || '')),
-  ];
-  if (prod?.og_image) {
-    const ogb = await fetchAsBase64(prod.og_image).catch(()=>null);
-    if (ogb) refBlobs.unshift(ogb);
-  }
-  const refs = refBlobs.slice(0,3);
+  // 0) gather refs: brand refs → OG from pasted link (if any) → (optional) webSearchRefs
+  const brandRefs = await fetchBrandRefs(prod?.name || prod?.title || '');
+  const ogRef = prod?.og_image ? await fetchAsBase64(prod.og_image).catch(()=>null) : null;
+  const webRefs = []; // optionally: ...(await webSearchRefs(prod?.name || ''))
+  const refBlobs = [...brandRefs, ...(ogRef ? [ogRef] : []), ...webRefs].slice(0,3);
 
-  // 1) try photoreal packshot (no text)
+  // 1) photoreal/brand-true packshot (no text)
   try {
     const p1 = await buildImagePrompt(prod, style, false, !_sharp);
-    let b1 = await generateProductImageBytes({ prompt: p1, refImages: refs });
-
-    // add server-side watermark if available; otherwise the prompt already asked for it
+    let b1 = await generateProductImageBytes({ prompt: p1, refImages: refBlobs });
     if (_sharp) {
       const wm = await addWatermarkToBuffer(b1, 'Harshportal');
       if (wm) b1 = wm;
     }
-
     return await uploadImageBufferToSupabase(b1, { table, filename: 'ai.png', contentType: 'image/png' });
   } catch (e) {
-    console.warn('gen packshot failed:', e?.message || e);
+    console.warn('packshot failed:', e?.message || e);
   }
 
-  // 2) fallback: big readable title image (matches brand vibe)
+  // 2) big title fallback (brand colors)
   try {
     const p2 = await buildImagePrompt(prod, style, true, !_sharp);
-    let b2 = await generateProductImageBytes({ prompt: p2, refImages: refs });
-
+    let b2 = await generateProductImageBytes({ prompt: p2, refImages: refBlobs });
     if (_sharp) {
       const wm2 = await addWatermarkToBuffer(b2, 'Harshportal');
       if (wm2) b2 = wm2;
     }
-
     return await uploadImageBufferToSupabase(b2, { table, filename: 'ai.png', contentType: 'image/png' });
   } catch (e) {
-    console.warn('gen title-image failed:', e?.message || e);
+    console.warn('title-image failed:', e?.message || e);
   }
 
-  // 3) last-resort SVG (always works, with watermark text baked in)
+  // 3) SVG last resort
   const svg = makeTextCardSvg(prod?.name || 'Digital Product', prod?.plan || prod?.subcategory || '');
   const svgBuf = Buffer.from(svg, 'utf8');
   return uploadImageBufferToSupabase(svgBuf, { table, filename: 'ai.svg', contentType: 'image/svg+xml' });
