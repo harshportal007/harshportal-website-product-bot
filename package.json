@@ -16,6 +16,7 @@
     "@google/generative-ai": "latest",
     "@supabase/supabase-js": "^2.54.0",
     "dotenv": "^17.2.1",
+    "node-fetch": "^3.3.2",
     "openai": "^5.12.2",
     "sharp": "^0.34.3",
     "telegraf": "^4.16.3"

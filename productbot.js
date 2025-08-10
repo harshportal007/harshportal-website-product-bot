@@ -1,7 +1,7 @@
 require('dotenv').config();
 const { Telegraf, session, Markup } = require('telegraf');
 const { createClient } = require('@supabase/supabase-js');
-const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
+const fetch = globalThis.fetch ?? ((...a) => import('node-fetch').then(({ default: f }) => f(...a)));
 const { GoogleGenerativeAI } = require('@google/generative-ai'); // ✅ keep
 const OpenAI = require('openai');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -610,7 +610,8 @@ async function generateProductImageBytes({ prompt, refImages = [], brandName }) 
   for (const r of (refImages || []).slice(0, 3)) {
     if (r?.b64) parts.push({ inlineData: { data: r.b64, mimeType: r.mime || 'image/jpeg' } });
   }
-  parts.push({ text: prompt });
+  const safePrompt = String(prompt || '');
+  parts.push({ text: safePrompt });
 
   for (const id of candidates) {
     try {
@@ -922,12 +923,13 @@ async function ensureImageForProduct(prod, table, style = 'neo') {
 
   // 1) Brand-true logo tile (with name)
   try {
-    const prompt = await buildImagePrompt(prod, style, !_sharp /* ask prompt to add watermark only if sharp missing */);
-     const brandName = shortBrandName(prod);         
-  let buf = await generateProductImageBytes({     
-    refImages: refBlobs,
-    brandName
-  });
+   const prompt = await buildImagePrompt(prod, style, !_sharp /* ask prompt to add watermark only if sharp missing */);
+    const brandName = shortBrandName(prod);
+    let buf = await generateProductImageBytes({
+      prompt,
+      refImages: refBlobs,
+     brandName
+    });
 
     // Prefer server watermark (consistent & always visible)
       if (_sharp) {
