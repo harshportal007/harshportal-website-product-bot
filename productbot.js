@@ -95,6 +95,28 @@ async function tgFileUrl(fileId) {
   }
 }
 
+function guessMime(buf, filenameHint='') {
+  const ext = (filenameHint.split('.').pop() || '').toLowerCase();
+  const head = buf.subarray(0, 12);
+
+  const isPNG  = head[0]===0x89 && head[1]===0x50 && head[2]===0x4E && head[3]===0x47;
+  const isJPG  = head[0]===0xFF && head[1]===0xD8 && head[2]===0xFF;
+  const isRIFF = head[0]===0x52 && head[1]===0x49 && head[2]===0x46 && head[3]===0x46 &&
+                 head[8]===0x57 && head[9]===0x45 && head[10]===0x42 && head[11]===0x50; // WEBP
+
+  if (isPNG) return { mime: 'image/png', ext: 'png' };
+  if (isJPG) return { mime: 'image/jpeg', ext: 'jpg' };
+  if (isRIFF) return { mime: 'image/webp', ext: 'webp' };
+
+  if (ext === 'png') return { mime: 'image/png', ext: 'png' };
+  if (ext === 'jpg' || ext === 'jpeg') return { mime: 'image/jpeg', ext: 'jpg' };
+  if (ext === 'webp') return { mime: 'image/webp', ext: 'webp' };
+  if (ext === 'svg') return { mime: 'image/svg+xml', ext: 'svg' };
+
+  return { mime: 'image/jpeg', ext: 'jpg' };
+}
+
+
 
 /* --------------- OpenGraph hinting from URLs --------------- */
 const findUrls = (txt = '') => (txt.match(/https?:\/\/\S+/gi) || []).slice(0, 5);
@@ -146,17 +168,32 @@ async function rehostToSupabase(fileUrl, filenameHint = 'image.jpg', table) {
     if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
 
+    // choose bucket/folder
     const bucket = table === TABLES.products
       ? (process.env.SUPABASE_BUCKET_PRODUCTS || 'images')
       : (process.env.SUPABASE_BUCKET_EXCLUSIVE || 'exclusiveproduct-images');
-
     const folder = table === TABLES.products ? 'products' : 'exclusive-products';
-    const key = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2)}-${filenameHint}`;
 
-    console.log('[upload] bucket=', bucket, 'key=', key);
+    // decide mime/ext
+    const headerCT = (res.headers.get('content-type') || '').toLowerCase();
+    let { mime, ext } = guessMime(buf, filenameHint);
+    if (headerCT.startsWith('image/') && headerCT !== 'application/octet-stream') {
+      // trust real image content-types from upstream, otherwise keep our guess
+      mime = headerCT;
+      ext  = headerCT.includes('png') ? 'png'
+          : headerCT.includes('webp') ? 'webp'
+          : headerCT.includes('svg') ? 'svg' : 'jpg';
+    }
+
+    // make filename match the mime we’ll store
+    const base = filenameHint.replace(/\.[A-Za-z0-9]+$/, '');
+    const safeName = `${base}.${ext}`;
+    const key = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2)}-${safeName}`;
+
+    console.log('[upload] bucket=', bucket, 'key=', key, 'mime=', mime);
 
     const { error: upErr } = await supabase.storage.from(bucket).upload(key, buf, {
-      contentType: res.headers.get('content-type') || 'image/jpeg',
+      contentType: mime,
       upsert: true,
     });
     if (upErr) {
@@ -169,9 +206,10 @@ async function rehostToSupabase(fileUrl, filenameHint = 'image.jpg', table) {
     return pub.publicUrl;
   } catch (e) {
     console.error('Rehost failed:', e.message);
-    throw e; // rethrow so caller shows the ❌ message
+    throw e;
   }
 }
+
 
 /* ---------------- Brand & Style helpers ---------------- */
 const STYLE_THEMES = {
