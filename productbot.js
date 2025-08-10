@@ -1471,64 +1471,89 @@ bot.action('save', async (ctx) => {
   const baseTags = uniqMerge(prod.tags, ai.tags);
 
    if (updateId) {
-  // rehost external image URLs (should be a no-op for Telegram uploads)
+  // rehost external url if needed
   if (prod.image && /^https?:\/\//i.test(prod.image) && !isSupabasePublicUrl(prod.image)) {
     try { prod.image = await ensureHostedInSupabase(prod.image, table); } catch {}
   }
 
-  // Discover which image column this table uses
+  // Find which column to use
   const { data: row, error: preErr } = await supabase
     .from(table)
-    .select('*')
-    .eq('id', updateId)
+    .select('id, image, image_url')
+    .eq('id', Number(updateId))
     .maybeSingle();
 
   if (preErr || !row) {
     await ctx.reply(`❌ Can't load row ${updateId}: ${preErr?.message || 'not found'}`);
     return;
   }
-
   const imgCol = ('image' in row) ? 'image' : (('image_url' in row) ? 'image_url' : null);
   if (!imgCol) {
     await ctx.reply('⚠️ No image column (`image` or `image_url`) found on this table.');
     return;
   }
-console.log('[save] about to write', table, updateId, 'imgCol=', imgCol, 'value=', payload[imgCol]);
 
-// Write first (no select here)
-const { error: upErr } = await supabase
-  .from(table)
-  .update(payload)
-  .eq('id', updateId);
+  const mergedTags = uniqMerge(prod.tags, ai.tags);
 
-if (upErr) {
-  await ctx.reply(`❌ Update failed: ${upErr.message}`);
+  const payload = (table === TABLES.products)
+    ? {
+        name: prod.name,
+        plan: prod.plan || null,
+        validity: prod.validity || null,
+        price: prod.price || null,
+        originalPrice: prod.originalPrice || null,
+        description: prod.description || ai.description || null,
+        category: normalizeCategory({ ...prod, ...ai }, ai.category),
+        subcategory: ai.subcategory || null,
+        stock: prod.stock || null,
+        tags: mergedTags,
+        features: ai.features || [],
+        gradient: ai.gradient || [],
+        [imgCol]: prod.image || null,
+      }
+    : {
+        name: prod.name,
+        description: prod.description || ai.description || null,
+        price: prod.price || null,
+        tags: mergedTags,
+        [imgCol]: prod.image || null,
+      };
+
+  console.log('[save] about to write', table, updateId, 'imgCol=', imgCol, 'value=', payload[imgCol]);
+
+  // 1) Write
+  const { error: upErr } = await supabase
+    .from(table)
+    .update(payload)
+    .eq('id', Number(updateId));
+  if (upErr) {
+    await ctx.reply(`❌ Update failed: ${upErr.message}`);
+    return;
+  }
+
+  // 2) Read-after-write to verify what’s actually saved
+  const { data: fresh, error: readErr } = await supabase
+    .from(table)
+    .select(`id, ${imgCol}`)
+    .eq('id', Number(updateId))
+    .maybeSingle();
+
+  if (readErr) {
+    console.log('[image:update] read-after-write error:', readErr);
+  } else {
+    console.log('[image:update]', table, updateId, '->', imgCol, fresh?.[imgCol]);
+  }
+
+  await ctx.reply(escapeMd(`✅ Updated ${table}`), { parse_mode: 'MarkdownV2' });
+  await ctx.reply('What next?', kbAfterTask());
+
+  ctx.session.review = null;
+  if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && Array.isArray(ctx.session.products)) {
+    return handleBulkStep(ctx);
+  }
+  ctx.session.mode = null;
   return;
 }
-
-// Fetch fresh to confirm column value
-const { data: fresh, error: readErr } = await supabase
-  .from(table)
-  .select(`id, ${imgCol}`)
-  .eq('id', updateId)
-  .maybeSingle();
-
-if (readErr) {
-  console.log('[image:update] read-after-write error:', readErr);
-} else {
-  console.log('[image:update]', table, updateId, '->', imgCol, fresh?.[imgCol]);
-}
-
-await ctx.reply(escapeMd(`✅ Updated ${table}`), { parse_mode: 'MarkdownV2' });
-await ctx.reply('What next?', kbAfterTask());
-
-ctx.session.review = null;
-if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && Array.isArray(ctx.session.products)) {
-  return handleBulkStep(ctx);
-}
-ctx.session.mode = null;
-return;
-   }
 
 
 
