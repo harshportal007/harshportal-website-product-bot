@@ -582,50 +582,57 @@ async function generateBackgroundWithOpenAI(prompt) {
 // Accept refs and build parts accordingly
 async function generateProductImageBytes({ prompt, refImages = [], brandName }) {
   const backend = (process.env.IMG_BACKEND || '').toLowerCase();
+  console.log('[img] backend:', backend, 'openaiModel:', process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1');
 
   if (backend === 'openai') {
+    // pure OpenAI image gen
     return generateImageOpenAI({ prompt });
   }
 
   if (backend === 'openai-bg') {
+    // OpenAI background + exact logo overlay
     const bgBuf = await generateBackgroundWithOpenAI(prompt);
     const logoRef = refImages?.[0];
-    if (!logoRef?.b64) throw new Error('No logo reference available for openai-bg');
+    if (!logoRef?.b64) throw new Error('No logo reference available');
     return composeTileWithLogo({ bgBuf, logoRef, brandName });
   }
 
-  const candidates = [...new Set([
+  // Fallback to Gemini image models (with refs)
+  const candidates = Array.from(new Set([
     DEFAULT_IMAGE_MODEL,
     'gemini-2.0-flash-preview-image-generation',
     'gemini-2.0-flash-exp',
     'gemini-2.0-flash',
-  ])];
-
-  const parts = [
-    ...refImages.slice(0,3).filter(r => r?.b64)
-      .map(r => ({ inlineData: { data: r.b64, mimeType: r.mime || 'image/jpeg' } })),
-    { text: prompt }
-  ];
+  ]));
 
   let lastErr;
+  const parts = [];
+  for (const r of (refImages || []).slice(0, 3)) {
+    if (r?.b64) parts.push({ inlineData: { data: r.b64, mimeType: r.mime || 'image/jpeg' } });
+  }
+  parts.push({ text: prompt });
+
   for (const id of candidates) {
     try {
       const model = genAI.getGenerativeModel({ model: id });
       const res = await model.generateContent({
         contents: [{ role: 'user', parts }],
-        generationConfig: { temperature: 0.2, responseModalities: ['TEXT','IMAGE'] },
+        generationConfig: { temperature: 0.2, responseModalities: ['TEXT', 'IMAGE'] },
       });
       const prts = res.response?.candidates?.[0]?.content?.parts ?? [];
-      const imagePart = prts.find(p => p.inlineData?.data);
+      const imagePart = prts.find(p => p.inlineData && p.inlineData.data);
       if (!imagePart) throw new Error('No inline image returned');
       return Buffer.from(imagePart.inlineData.data, 'base64');
     } catch (e) {
       lastErr = e;
-      console.warn(`[gen] ${id} failed:`, e?.message || e);
+      console.warn(`Image model "${id}" failed:`, e?.message || e);
     }
   }
-  throw Object.assign(new Error('All image models failed'), { cause: lastErr });
+  const err = new Error('All image models failed');
+  err.cause = lastErr;
+  throw err;
 }
+
 
 
 async function uploadImageBufferToSupabase(
@@ -1730,6 +1737,5 @@ bot.catch((err, ctx) => {
 
 bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
 bot.launch();
-console.log('[img] backend:', backend);
 console.log('🚀 Product Bot running with /smartadd and /update');
 
