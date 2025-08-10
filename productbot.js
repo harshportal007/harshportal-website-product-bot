@@ -1471,78 +1471,70 @@ bot.action('save', async (ctx) => {
   const baseTags = uniqMerge(prod.tags, ai.tags);
 
    if (updateId) {
-    // 1) ensure image is hosted in your Supabase storage
-    if (prod.image && /^https?:\/\//i.test(prod.image) && !isSupabasePublicUrl(prod.image)) {
-      try {
-        prod.image = await ensureHostedInSupabase(prod.image, table);
-      } catch (e) {
-        await ctx.reply(`⚠️ Couldn't rehost image, keeping the original URL. ${e?.message ?? ''}`);
-      }
-    }
+  // ensure hosted (no-op for your Supabase URL)
+  if (prod.image && /^https?:\/\//i.test(prod.image) && !isSupabasePublicUrl(prod.image)) {
+    try { prod.image = await ensureHostedInSupabase(prod.image, table); } catch {}
+  }
 
-    const isProducts = table === TABLES.products;
+  const isProducts = table === TABLES.products;
 
-    // 2) detect which column the row actually uses: image or image_url
-    let imgCol = isProducts ? 'image' : 'image_url';
-    try {
-      const { data: probe } = await supabase
-        .from(table)
-        .select(isProducts ? 'id,image,image_url' : 'id,image_url')
-        .eq('id', updateId).maybeSingle();
-      if (isProducts && probe && typeof probe.image === 'undefined' && typeof probe.image_url !== 'undefined') {
-        imgCol = 'image_url';
-      }
-    } catch {}
-
-    // 3) build payloads
-    if (isProducts) {
-      const payload = {
-        name: prod.name,
-        plan: prod.plan || null,
-        validity: prod.validity || null,
-        price: prod.price || null,
-        originalPrice: prod.originalPrice || null,
-        description: prod.description || ai.description || null,
-        category: normalizeCategory({ ...prod, ...ai }, ai.category),
-        subcategory: ai.subcategory || null,
-        stock: prod.stock || null,
-        tags: uniqMerge(prod.tags, ai.tags),
-        features: ai.features || [],
-        gradient: ai.gradient || [],
-      };
-      payload[imgCol] = prod.image || null;
-
-      const { error } = await supabase.from(TABLES.products).update(payload).eq('id', updateId);
-      if (error) return ctx.reply(`❌ Update failed: ${error.message}`);
-    } else {
-      const payload = {
-        name: prod.name,
-        description: prod.description || ai.description || null,
-        price: prod.price || null,
-        image_url: prod.image || null,
-        tags: uniqMerge(prod.tags, ai.tags),
-      };
-      const { error } = await supabase.from(TABLES.exclusive).update(payload).eq('id', updateId);
-      if (error) return ctx.reply(`❌ Update failed: ${error.message}`);
-    }
-
-    // 4) verify + log what was saved
-    const { data: check } = await supabase
+  // which column exists?
+  let imgCol = isProducts ? 'image' : 'image_url';
+  try {
+    const { data: probe } = await supabase
       .from(table)
-      .select(isProducts ? `id,${imgCol}` : 'id,image_url')
+      .select(isProducts ? 'id,image,image_url' : 'id,image_url')
       .eq('id', updateId).maybeSingle();
-    console.log('[post-save]', table, updateId, 'image ->', isProducts ? check?.[imgCol] : check?.image_url);
-
-    await ctx.reply(escapeMd(`✅ Updated ${table}`), { parse_mode: 'MarkdownV2' });
-    await ctx.reply('What next?', kbAfterTask());
-
-    ctx.session.review = null;
-    if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && Array.isArray(ctx.session.products)) {
-      return handleBulkStep(ctx);
+    if (isProducts && probe && typeof probe.image === 'undefined' && typeof probe.image_url !== 'undefined') {
+      imgCol = 'image_url';
     }
-    ctx.session.mode = null;
+  } catch {}
+
+  // 1) minimal update: only the image column
+  let { data: after, error: upErr } = await supabase
+    .from(table)
+    .update({ [imgCol]: prod.image || null })
+    .eq('id', updateId)
+    .select(isProducts ? `id,${imgCol}` : 'id,image_url')
+    .maybeSingle();
+
+  if (upErr) {
+    await ctx.reply(`❌ Update failed: ${upErr.message}`);
     return;
   }
+
+  // 2) if value didn't change, try the alternate column name (safety net)
+  const savedNow = after?.[imgCol];
+  if (savedNow !== prod.image && isProducts) {
+    const altCol = imgCol === 'image' ? 'image_url' : 'image';
+    const { data: afterAlt, error: e2 } = await supabase
+      .from(table)
+      .update({ [altCol]: prod.image || null })
+      .eq('id', updateId)
+      .select(`id,${altCol}`)
+      .maybeSingle();
+    console.log('[save:image] retry on altCol=', altCol, '->', afterAlt?.[altCol], e2 || '');
+  }
+
+  // final check + log
+  const { data: check } = await supabase
+    .from(table)
+    .select(isProducts ? `id,image,image_url` : 'id,image_url')
+    .eq('id', updateId).maybeSingle();
+
+  console.log('[post-save:final]', table, updateId, 'image=', check?.image, 'image_url=', check?.image_url);
+
+  await ctx.reply(escapeMd(`✅ Updated ${table}`), { parse_mode: 'MarkdownV2' });
+  await ctx.reply('What next?', kbAfterTask());
+
+  ctx.session.review = null;
+  if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && Array.isArray(ctx.session.products)) {
+    return handleBulkStep(ctx);
+  }
+  ctx.session.mode = null;
+  return;
+}
+
 
 
   // INSERT new (dupe guard)
