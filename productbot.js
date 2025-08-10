@@ -480,51 +480,69 @@ Text:
   }
 }
 
+function shortBrandName(prod) {
+  const b = getBrandStyle(prod);
+  if (b?.name) return b.name;
+  const n = String(prod?.name || '')
+    .replace(/\b(premium|pro|subscription|subs|account|license|key|activation)\b/ig, '')
+    .trim();
+  return n || (prod?.name || 'Product');
+}
+
+
 /* ---------------- IMAGE GENERATION: match 80–99% + watermark ---------------- */
 
 // Build prompt for packshot (no text) or title mode, allow prompt-watermark flag
 // 80–99% match prompt builder (supports optional prompt-watermark)
-async function buildImagePrompt(prod, styleName = 'neo', forceText = false, wantPromptWatermark = false) {
+async function buildImagePrompt(prod, styleName = 'neo', wantPromptWatermark = false) {
   const model = genAI.getGenerativeModel({ model: TEXT_MODEL });
   const themeText = STYLE_THEMES[styleName] || STYLE_THEMES.neo;
-
   const brand = getBrandStyle(prod);
-  const recipe = brandRecipe(prod); // <- hard steer for known brands
-
-  const brandName = brand?.name || (prod?.category || 'Digital product');
-  const palette = recipe ? `${recipe.bg}, ${recipe.fg}` : (brand?.palette?.join(', ') || 'brand-accurate colors');
-
-  const NO_TEXT_NEG = 'no words, no captions, no letters, no typography, no type, no watermark, no borders';
+ const brandName = shortBrandName(prod);
+  const palette = brand?.palette?.join(', ') || 'brand-accurate colors';
+  const brandHints = brand?.keywords || 'official logomark proportions';
 
   const sys = `
-Write one precise prompt for an image model that may also receive up to 3 reference images.
-Goal: brand-authentic 1:1 **app-icon/packshot** that matches the real product **80–99%** (glyph shape, proportions, colors).
-If includeText=true then add large clean title; otherwise absolutely **no text**.`;
+Create a 1024x1024 ecommerce product tile. You may receive up to 3 reference images.
+MUST reproduce the official brand/logo silhouette and colors **80–99%** as in the references.
+Layout:
+- large logo centered
+- short brand/product name beneath the logo in bold, clean sans-serif
+- keep at least 10% padding from every edge
+No borders. No extra iconography. Do NOT invent a new logo.`;
+
+
+const recipe = brandRecipe(prod);
+const motif = recipe
+  ? `Visual recipe: ${recipe.describe}. Background ${recipe.bg}, logo color ${recipe.fg}.`
+  : brandHints;
+
 
   const user = `
-Product: ${JSON.stringify({ name: prod?.name, category: prod?.category, tags: prod?.tags })}
+Product:
+${JSON.stringify({ name: prod?.name, category: prod?.category, tags: prod?.tags })}
 
-${recipe ? `Icon recipe: ${recipe.describe}. Background ${recipe.bg}. Foreground ${recipe.fg}.` : ''}
-Theme: ${themeText}
+Brand/context: ${brandName}
 Palette: ${palette}
+Motifs: ${motif}
 
-Composition:
-- centered hero icon; crisp edges; replicate official glyph silhouette and proportions from references
-- background: clean studio or rounded-square brand tile; subtle vignette ok
-- vary per brand (not generic gradient circles)
+Rules:
+- Treat reference images as ground truth for shape and color.
+- Keep name text short and **fully readable** within the tile bounds.
+- Avoid generic gradient circles; vary the look per brand.
+${wantPromptWatermark ? 'Add a tiny bottom-right watermark text: "Harshportal".' : ''}
 
-includeText: ${forceText ? 'true' : 'false'}
-${wantPromptWatermark ? 'Add a tiny corner text watermark: "Harshportal".' : ''}
-
-Negative: ${forceText ? 'tiny, unreadable text, messy layout' : NO_TEXT_NEG}. Heavy glare, extra logos.`;
+Negative: placeholder blobs, tiny/cropped text, extra logos, heavy glare, borders, watermarks (unless requested).`;
 
   try {
     const out = await model.generateContent([{ role: 'user', parts: [{ text: sys + '\n' + user }]}]);
     return out.response.text().trim().replace(/\s+/g, ' ');
   } catch {
-    return `1:1 brand-authentic icon for ${prod?.name || brandName}, replicate official glyph and colors, ${themeText}, match references 80–99%, ${forceText ? `with big readable "${prod?.name || brandName}" text` : 'no text'}.`;
+    return `Brand-accurate 1:1 tile for ${brandName}; large centered official logo; readable brand name under it; ${themeText}; match references 80–99%; no borders.`;
   }
+
 }
+
 
 
 
@@ -547,9 +565,9 @@ async function generateProductImageBytes({ prompt, refImages = [] }) {
     try {
       const model = genAI.getGenerativeModel({ model: id });
       const res = await model.generateContent({
-        contents: [{ role: 'user', parts }],
-        generationConfig: { responseModalities: ['TEXT', 'IMAGE'] },
-      });
+  contents: [{ role: 'user', parts }],
+  generationConfig: { temperature: 0.2, responseModalities: ['TEXT','IMAGE'] },
+});
       const prts = res.response?.candidates?.[0]?.content?.parts ?? [];
       const imagePart = prts.find(p => p.inlineData && p.inlineData.data);
       if (!imagePart) throw new Error('No inline image returned');
@@ -630,10 +648,9 @@ function makeTextCardSvg(title = 'Product', subtitle = '') {
 
 // --- map common products to their real domains (extend anytime) ---
 const BRAND_DOMAIN_MAP = {
-  'spotify': 'spotify.com',
+  'spotify': 'spotify.com', 'spotify premium': 'spotify.com',
   'netflix': 'netflix.com',
-  'youtube': 'youtube.com',
-  'yt premium': 'youtube.com',
+  'youtube': 'youtube.com', 'yt premium': 'youtube.com',
   'disney': 'disneyplus.com',
   'prime video': 'primevideo.com', 'prime': 'primevideo.com',
   'descript': 'descript.com',
@@ -647,11 +664,10 @@ const BRAND_DOMAIN_MAP = {
   'magic patterns': 'magicpatterns.design',
   'wispr': 'wispr.cc', 'wispr flow': 'wispr.cc',
   'windows': 'microsoft.com', 'windows 10': 'microsoft.com', 'windows 11': 'microsoft.com',
-  'v0': 'v0.dev',
-'v0.dev': 'v0.dev',
-'vercel v0': 'v0.dev',
-'vercel': 'vercel.com',
+  'v0': 'v0.dev', 'v0.dev': 'v0.dev', 'vercel v0': 'v0.dev',
+  'vercel': 'vercel.com',
 };
+
 
 function resolveBrandDomain(name = '') {
   const n = String(name).toLowerCase().trim();
@@ -668,15 +684,31 @@ function resolveBrandDomain(name = '') {
 async function fetchBrandRefs(name) {
   const refs = [];
   const domain = resolveBrandDomain(name);
+
   if (domain) {
-    refs.push(`https://logo.clearbit.com/${domain}?size=512`);
+    refs.push(`https://logo.clearbit.com/${domain}?size=1024`);
     try {
       const og = await getOG(`https://${domain}`);
       if (og?.image) refs.push(og.image);
     } catch {}
+    // small but sometimes useful:
+    refs.push(`https://icons.duckduckgo.com/ip3/${domain}.ico`);
     refs.push(`https://unavatar.io/${domain}`);
   }
-  // dedupe → fetch as base64
+
+  // Wikipedia often returns the official wordmark/logo
+  try {
+    const cleaned = String(name).replace(/\b(subscription|premium|pro|account|key)\b/ig,'').trim();
+    const q = encodeURIComponent(cleaned);
+    const r = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${q}`);
+    if (r.ok) {
+      const j = await r.json();
+      if (j?.thumbnail?.source) refs.push(j.thumbnail.source);
+      if (j?.originalimage?.source) refs.push(j.originalimage.source);
+    }
+  } catch {}
+
+  // fetch as base64
   const uniq = Array.from(new Set(refs.filter(Boolean))).slice(0, 3);
   const blobs = [];
   for (const u of uniq) {
@@ -727,45 +759,87 @@ async function webSearchRefs(productName) {
   }
 }
 
+// --- deterministic brand tile (uses first fetched ref) ---
+// PLACE THIS JUST ABOVE ensureImageForProduct(...)
+async function composeBrandTile(prod, table) {
+  if (!_sharp) return null;
+
+  const refs = await fetchBrandRefs(prod?.name || '');
+  const ref = refs[0];
+  if (!ref) return null;
+
+  const size = 1024;
+  const recipe = brandRecipe(prod) || { bg: '#0b0b0b', fg: '#ffffff' };
+  const brand = shortBrandName(prod);
+
+  // base background
+  let out = await _sharp({
+    create: { width: size, height: size, channels: 3, background: recipe.bg }
+  }).png().toBuffer();
+
+  // center the logo (~54% width)
+  const logoBuf = Buffer.from(ref.b64, 'base64');
+  const resized = await _sharp(logoBuf)
+    .resize(Math.round(size * 0.54), null, { fit: 'inside' })
+    .png()
+    .toBuffer();
+
+  const meta = await _sharp(resized).metadata();
+  const left = Math.round((size - (meta.width || 0)) / 2);
+  const top  = Math.round(size * 0.18);
+
+  out = await _sharp(out).composite([{ input: resized, left, top }]).png().toBuffer();
+
+  // brand name text (SVG overlay)
+  const textSvg = Buffer.from(`
+    <svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">
+      <text x="50%" y="${Math.round(size * 0.85)}"
+            font-family="Inter, Segoe UI, Roboto, Arial"
+            font-size="${Math.round(size * 0.09)}"
+            font-weight="800" fill="#ffffff" text-anchor="middle">${brand}</text>
+    </svg>`);
+  out = await _sharp(out).composite([{ input: textSvg }]).png().toBuffer();
+
+  // watermark (optional)
+  out = (await addWatermarkToBuffer(out, 'Harshportal')) || out;
+
+  return uploadImageBufferToSupabase(out, { table, filename: 'brand.png', contentType: 'image/png' });
+}
+
 
 
 async function ensureImageForProduct(prod, table, style = 'neo') {
-  // respect manual/uploaded image
+  // Respect existing image (manual upload / URL)
   if (prod?.image && String(prod.image).trim()) return prod.image;
 
-  // 0) gather refs: brand refs → OG from pasted link (if any) → (optional) webSearchRefs
+  // Collect up to 3 strong refs
   const brandRefs = await fetchBrandRefs(prod?.name || prod?.title || '');
-  const ogRef = prod?.og_image ? await fetchAsBase64(prod.og_image).catch(()=>null) : null;
-  const webRefs = await webSearchRefs(prod?.name || '');
-  const refBlobs = [...brandRefs, ...(ogRef ? [ogRef] : []), ...webRefs].slice(0,3);
+  const ogRef = prod?.og_image ? await fetchAsBase64(prod.og_image).catch(() => null) : null;
+  const refBlobs = [...brandRefs, ...(ogRef ? [ogRef] : [])].slice(0, 3);
 
-  // 1) photoreal/brand-true packshot (no text)
-  try {
-    const p1 = await buildImagePrompt(prod, style, false, !_sharp);
-    let b1 = await generateProductImageBytes({ prompt: p1, refImages: refBlobs });
-    if (_sharp) {
-      const wm = await addWatermarkToBuffer(b1, 'Harshportal');
-      if (wm) b1 = wm;
-    }
-    return await uploadImageBufferToSupabase(b1, { table, filename: 'ai.png', contentType: 'image/png' });
+    try {
+    const deterministic = await composeBrandTile(prod, table);
+    if (deterministic) return deterministic;
   } catch (e) {
-    console.warn('packshot failed:', e?.message || e);
+    console.warn('composeBrandTile failed:', e?.message || e);
   }
 
-  // 2) big title fallback (brand colors)
+  // 1) Brand-true logo tile (with name)
   try {
-    const p2 = await buildImagePrompt(prod, style, true, !_sharp);
-    let b2 = await generateProductImageBytes({ prompt: p2, refImages: refBlobs });
+    const prompt = await buildImagePrompt(prod, style, !_sharp /* ask prompt to add watermark only if sharp missing */);
+    let buf = await generateProductImageBytes({ prompt, refImages: refBlobs });
+
+    // Prefer server watermark (consistent & always visible)
     if (_sharp) {
-      const wm2 = await addWatermarkToBuffer(b2, 'Harshportal');
-      if (wm2) b2 = wm2;
+      const wm = await addWatermarkToBuffer(buf, 'Harshportal');
+      if (wm) buf = wm;
     }
-    return await uploadImageBufferToSupabase(b2, { table, filename: 'ai.png', contentType: 'image/png' });
+    return await uploadImageBufferToSupabase(buf, { table, filename: 'ai.png', contentType: 'image/png' });
   } catch (e) {
-    console.warn('title-image failed:', e?.message || e);
+    console.warn('brand tile generation failed:', e?.message || e);
   }
 
-  // 3) SVG last resort
+  // 2) Guaranteed fallback: big readable title SVG (brand colors) + watermark baked in SVG
   const svg = makeTextCardSvg(prod?.name || 'Digital Product', prod?.plan || prod?.subcategory || '');
   const svgBuf = Buffer.from(svg, 'utf8');
   return uploadImageBufferToSupabase(svgBuf, { table, filename: 'ai.svg', contentType: 'image/svg+xml' });
@@ -1128,137 +1202,87 @@ bot.on('text', async (ctx, next) => {
 });
 
 /* --------------------- photo handlers (unchanged upload flow) --------------------- */
-bot.on('photo', async (ctx) => {
-  if (!isAdmin(ctx)) return;
+  // -- put this helper near your other helpers --
+async function processIncomingImage(ctx, fileId, filenameHint = 'prod.jpg') {
+  const href = await tgFileUrl(fileId); // robust, works for photo & document
 
-  const photos = ctx.message?.photo || [];
-  const fileId = photos.at(-1)?.file_id;
-  if (!fileId) return;
-
-  // use the stable Telegram URL
-  const href = await tgFileUrl(fileId);
-
-  // EDIT MODE image
+  // 1) EDIT MODE: user tapped "image" on the review keyboard
   if (ctx.session.awaitEdit === 'image' && ctx.session.review) {
     try {
       const { table } = ctx.session.review;
-      const imgUrl = await rehostToSupabase(href, 'prod.jpg', table);
+      const imgUrl = await rehostToSupabase(href, filenameHint, table);
       ctx.session.review.prod.image = imgUrl;
       ctx.session.awaitEdit = null;
       const { prod, ai } = ctx.session.review;
       await ctx.replyWithMarkdownV2(reviewMessage(prod, ai, table), kbConfirm);
     } catch (e) {
       console.error('edit image upload error:', e);
-      await ctx.reply('❌ Could not update image. Try again or paste a direct image URL.');
+      await ctx.reply(`❌ Could not update image. ${e?.message || ''}\nPaste a direct image URL if it keeps failing.`);
     }
     return;
   }
 
-  // manual wizard photo
+  // 2) MANUAL WIZARD PHOTO
   if (ctx.session.mode === 'manual-photo') {
-    const imgUrl = await rehostToSupabase(href, 'prod.jpg', ctx.session.table);
-    const prod = ctx.session.form.prod;
-    prod.image = imgUrl;
-
-    const ai = await enrichWithAI(prod, '', {});
-    ctx.session.review = { prod, ai, table: ctx.session.table };
-    return ctx.replyWithMarkdownV2(reviewMessage(prod, ai, ctx.session.table), kbConfirm);
+    try {
+      const imgUrl = await rehostToSupabase(href, filenameHint, ctx.session.table);
+      const prod = ctx.session.form.prod;
+      prod.image = imgUrl;
+      const ai = await enrichWithAI(prod, '', {});
+      ctx.session.review = { prod, ai, table: ctx.session.table };
+      await ctx.replyWithMarkdownV2(reviewMessage(prod, ai, ctx.session.table), kbConfirm);
+    } catch (e) {
+      console.error('manual photo upload error:', e);
+      await ctx.reply(`❌ Could not upload that image. ${e?.message || ''}`);
+    }
+    return;
   }
 
-  // smart add photo
+  // 3) SMART ADD PHOTO
   if (ctx.session.mode === 'smart-photo') {
-    ctx.session.smart.photo = await rehostToSupabase(href, 'prod.jpg', ctx.session.table);
-    const prod = { ...ctx.session.smart.prod, image: ctx.session.smart.photo };
-    const ai = await enrichWithAI(prod, ctx.session.smart.text, ctx.session.smart.og);
-    ctx.session.review = { prod: { ...prod, tags: uniqMerge(prod.tags, ai.tags) }, ai, table: ctx.session.table };
-    ctx.session.mode = null;
-    return ctx.replyWithMarkdownV2(reviewMessage(ctx.session.review.prod, ai, ctx.session.table), kbConfirm);
+    try {
+      ctx.session.smart.photo = await rehostToSupabase(href, filenameHint, ctx.session.table);
+      const prod = { ...ctx.session.smart.prod, image: ctx.session.smart.photo };
+      const ai = await enrichWithAI(prod, ctx.session.smart.text, ctx.session.smart.og);
+      ctx.session.review = { prod: { ...prod, tags: uniqMerge(prod.tags, ai.tags) }, ai, table: ctx.session.table };
+      ctx.session.mode = null;
+      await ctx.replyWithMarkdownV2(reviewMessage(ctx.session.review.prod, ai, ctx.session.table), kbConfirm);
+    } catch (e) {
+      console.error('smart photo upload error:', e);
+      await ctx.reply(`❌ Could not upload that image. ${e?.message || ''}`);
+    }
+    return;
   }
 
-  // BULK photo waiting
+  // 4) GEMINI BULK: waiting for an image for current item
   if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && ctx.session.await === 'image') {
     try {
-      const imgUrl = await rehostToSupabase(href, 'prod.jpg', ctx.session.table);
+      const imgUrl = await rehostToSupabase(href, filenameHint, ctx.session.table);
       const idx = ctx.session.index || 0;
       if (ctx.session.products?.[idx]) ctx.session.products[idx].image = imgUrl;
       ctx.session.await = null;
       return handleBulkStep(ctx);
     } catch (e) {
       console.error('bulk photo upload error:', e);
-      return ctx.reply('❌ Could not upload that image. Try again.');
-    }
-  }
-});
-
-
-// Accept images sent as "document" (PNG/WebP often arrive this way)
-bot.on('document', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-
-  const doc = ctx.message?.document;
-  if (!doc || !/^image\//i.test(doc.mime_type || '')) return;
-
-  const href = await tgFileUrl(doc.file_id);
-
-  // EDIT MODE
-  if (ctx.session.awaitEdit === 'image' && ctx.session.review) {
-    try {
-      const { table } = ctx.session.review;
-      const imgUrl = await rehostToSupabase(href, doc.file_name || 'prod.jpg', table);
-      ctx.session.review.prod.image = imgUrl;
-      ctx.session.awaitEdit = null;
-      const { prod, ai } = ctx.session.review;
-      await ctx.replyWithMarkdownV2(reviewMessage(prod, ai, table), kbConfirm);
-    } catch (e) {
-      console.error('edit image upload error (doc):', e);
-      await ctx.reply(`❌ Could not update image. ${e?.message || ''}\nPaste a direct image URL if it keeps failing.`);
+      await ctx.reply(`❌ Could not upload that image. ${e?.message || ''}`);
     }
     return;
   }
+}
 
-  // manual wizard
-  if (ctx.session.mode === 'manual-photo') {
-    try {
-      const imgUrl = await rehostToSupabase(href, doc.file_name || 'prod.jpg', ctx.session.table);
-      const prod = ctx.session.form.prod;
-      prod.image = imgUrl;
-      const ai = await enrichWithAI(prod, '', {});
-      ctx.session.review = { prod, ai, table: ctx.session.table };
-      return ctx.replyWithMarkdownV2(reviewMessage(prod, ai, ctx.session.table), kbConfirm);
-    } catch (e) {
-      console.error('manual photo upload error (doc):', e);
-      return ctx.reply(`❌ Could not upload that image. ${e?.message || ''}`);
-    }
-  }
+bot.on('photo', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const photos = ctx.message?.photo || [];
+  const fileId = photos.at(-1)?.file_id; // largest size
+  if (!fileId) return;
+  await processIncomingImage(ctx, fileId, 'prod.jpg');
+});
 
-  // smart add
-  if (ctx.session.mode === 'smart-photo') {
-    try {
-      ctx.session.smart.photo = await rehostToSupabase(href, doc.file_name || 'prod.jpg', ctx.session.table);
-      const prod = { ...ctx.session.smart.prod, image: ctx.session.smart.photo };
-      const ai = await enrichWithAI(prod, ctx.session.smart.text, ctx.session.smart.og);
-      ctx.session.review = { prod: { ...prod, tags: uniqMerge(prod.tags, ai.tags) }, ai, table: ctx.session.table };
-      ctx.session.mode = null;
-      return ctx.replyWithMarkdownV2(reviewMessage(ctx.session.review.prod, ai, ctx.session.table), kbConfirm);
-    } catch (e) {
-      console.error('smart photo upload error (doc):', e);
-      return ctx.reply(`❌ Could not upload that image. ${e?.message || ''}`);
-    }
-  }
-
-  // bulk
-  if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && ctx.session.await === 'image') {
-    try {
-      const imgUrl = await rehostToSupabase(href, doc.file_name || 'prod.jpg', ctx.session.table);
-      const idx = ctx.session.index || 0;
-      if (ctx.session.products?.[idx]) ctx.session.products[idx].image = imgUrl;
-      ctx.session.await = null;
-      return handleBulkStep(ctx);
-    } catch (e) {
-      console.error('bulk photo upload error (doc):', e);
-      return ctx.reply(`❌ Could not upload that image. ${e?.message || ''}`);
-    }
-  }
+bot.on('document', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const doc = ctx.message?.document;
+  if (!doc || !/^image\//i.test(doc.mime_type || '')) return; // ignore non-image docs
+  await processIncomingImage(ctx, doc.file_id, doc.file_name || 'prod.jpg');
 });
 
 
