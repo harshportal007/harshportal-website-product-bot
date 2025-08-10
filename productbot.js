@@ -81,6 +81,18 @@ function normalizeCategory(prodLike = {}, aiCategory) {
   return 'Download';
 }
 
+// Reliable Telegram file URL for both photos and documents
+async function tgFileUrl(fileId) {
+  try {
+    const f = await bot.telegram.getFile(fileId); // { file_path: '...' }
+    return `https://api.telegram.org/file/bot${bot.token}/${f.file_path}`;
+  } catch {
+    const link = await bot.telegram.getFileLink(fileId);
+    return typeof link === 'string' ? link : link.toString();
+  }
+}
+
+
 /* --------------- OpenGraph hinting from URLs --------------- */
 const findUrls = (txt = '') => (txt.match(/https?:\/\/\S+/gi) || []).slice(0, 5);
 
@@ -163,6 +175,14 @@ const BRAND_STYLES = [
     palette: ['#E50914', '#0B0B0B'],
     keywords: 'cinematic streaming, widescreen frame, ribbon arc, spotlight vignette'
   },
+
+{
+  match: /\bv0(\.dev)?|\bvercel\b/i,
+  name: 'Vercel v0',
+  palette: ['#0b0b0b', '#111111', '#ffffff'],
+  keywords: 'minimal monochrome, rounded square tile, official v0 glyph, black background, white logomark'
+},
+
   {
     match: /\byou ?tube|yt ?premium\b/i,
     name: 'YouTube',
@@ -196,6 +216,8 @@ const BRAND_STYLES = [
   },
 ];
 
+
+
 function getBrandStyle(prod) {
   const hay = [
     prod?.name, prod?.description, prod?.category, prod?.subcategory,
@@ -204,6 +226,43 @@ function getBrandStyle(prod) {
 
   for (const b of BRAND_STYLES) {
     if (b.match.test(hay)) return b;
+  }
+  return null;
+}
+
+
+// Brand icon "recipes" to force real look (rounded-square app icon style)
+const BRAND_ICON_RECIPES = {
+  spotify: {
+    bg: '#121212', fg: '#1DB954',
+    describe: 'rounded-square black app icon, centered green circle with three horizontal curved bars (audio waves)'
+  },
+  netflix: {
+    bg: '#0B0B0B', fg: '#E50914',
+    describe: 'rounded-square black app icon, centered red ribbon N monogram with diagonal fold'
+  },
+  youtube: {
+    bg: '#0f0f0f', fg: '#FF0000',
+    describe: 'rounded-square dark app icon, centered red rounded rectangle with white play triangle'
+  },
+  'v0': {
+    bg: '#0b0b0b', fg: '#ffffff',
+    describe: 'rounded-square pure black tile, minimalist white v0 monogram glyph'
+  },
+  raycast: {
+    bg: '#0b0b0b', fg: '#FF6363',
+    describe: 'rounded-square black tile, centered coral asterisk-like raycast glyph made of 4 bars'
+  },
+  warp: {
+    bg: '#0b0b0b', fg: '#7C4DFF',
+    describe: 'rounded-square black tile, centered angular W ribbon glyph in purple'
+  }
+};
+
+function brandRecipe(prod) {
+  const n = String(prod?.name || '').toLowerCase();
+  for (const key of Object.keys(BRAND_ICON_RECIPES)) {
+    if (n.includes(key)) return BRAND_ICON_RECIPES[key];
   }
   return null;
 }
@@ -227,22 +286,23 @@ let _sharp = null;
 try { _sharp = require('sharp'); } catch {}
 
 async function addWatermarkToBuffer(buf, text = 'Harshportal') {
-  if (!_sharp) return null; // fall back to prompt-watermark elsewhere
+  if (!_sharp) return null;
   const svg = Buffer.from(`
-  <svg xmlns="http://www.w3.org/2000/svg" width="900" height="240">
-    <text x="98%" y="80%"
-      font-family="Segoe UI, Roboto, Arial"
-      font-size="88" font-weight="800"
+  <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="320">
+    <text x="98%" y="82%"
+      font-family="Inter, Segoe UI, Roboto, Arial"
+      font-size="120" font-weight="900"
       text-anchor="end"
-      fill="#ffffff" opacity=".28"
-      stroke="#000000" stroke-opacity=".25" stroke-width="2"
-      transform="rotate(-8 800 180)">${text}</text>
+      fill="#ffffff" opacity=".38"
+      stroke="#000000" stroke-opacity=".28" stroke-width="3"
+      transform="rotate(-8 1000 250)">${text}</text>
   </svg>`);
   return await _sharp(buf)
     .composite([{ input: svg, gravity: 'southeast', blend: 'over' }])
     .png()
     .toBuffer();
 }
+
 
 
 /* ---------------- AI enrichment (unchanged logic) ---------------- */
@@ -427,42 +487,45 @@ Text:
 async function buildImagePrompt(prod, styleName = 'neo', forceText = false, wantPromptWatermark = false) {
   const model = genAI.getGenerativeModel({ model: TEXT_MODEL });
   const themeText = STYLE_THEMES[styleName] || STYLE_THEMES.neo;
+
   const brand = getBrandStyle(prod);
+  const recipe = brandRecipe(prod); // <- hard steer for known brands
+
   const brandName = brand?.name || (prod?.category || 'Digital product');
-  const palette = brand?.palette?.join(', ') || 'brand-accurate colors';
-  const brandHints = brand?.keywords || 'replicate official logomark shape/proportions';
+  const palette = recipe ? `${recipe.bg}, ${recipe.fg}` : (brand?.palette?.join(', ') || 'brand-accurate colors');
+
+  const NO_TEXT_NEG = 'no words, no captions, no letters, no typography, no type, no watermark, no borders';
 
   const sys = `
-Write a single, precise prompt for an image model that may also receive up to 3 reference images.
-Goal: a clean 1:1 **packshot** that matches the *real product/brand* **80–99%** (exact logo shape, colors, icon proportions).
-Use references as ground truth. No borders. No watermarks unless requested.`;
+Write one precise prompt for an image model that may also receive up to 3 reference images.
+Goal: brand-authentic 1:1 **app-icon/packshot** that matches the real product **80–99%** (glyph shape, proportions, colors).
+If includeText=true then add large clean title; otherwise absolutely **no text**.`;
 
   const user = `
-Product:
-${JSON.stringify({ name: prod?.name, category: prod?.category, subcategory: prod?.subcategory, tags: prod?.tags })}
+Product: ${JSON.stringify({ name: prod?.name, category: prod?.category, tags: prod?.tags })}
 
-Brand/context: ${brandName}
-Palette: ${palette}
-Motifs: ${brandHints}
+${recipe ? `Icon recipe: ${recipe.describe}. Background ${recipe.bg}. Foreground ${recipe.fg}.` : ''}
 Theme: ${themeText}
+Palette: ${palette}
 
 Composition:
-- centered hero card; crisp edges; **replicate official logomark**, not a generic gradient
-- background: subtle studio or brand gradient (not busy)
-- if references show a specific glyph (e.g., Spotify wave circle), copy its silhouette and proportions
-- ${forceText ? `include large, readable title text: "${prod?.name || brandName}"` : 'no text'}
+- centered hero icon; crisp edges; replicate official glyph silhouette and proportions from references
+- background: clean studio or rounded-square brand tile; subtle vignette ok
+- vary per brand (not generic gradient circles)
 
-${wantPromptWatermark ? 'Add a small corner text watermark: "Harshportal".' : ''}
+includeText: ${forceText ? 'true' : 'false'}
+${wantPromptWatermark ? 'Add a tiny corner text watermark: "Harshportal".' : ''}
 
-Negative: generic placeholder circles, tiny unreadable text, heavy glare, extra logos, borders.`;
+Negative: ${forceText ? 'tiny, unreadable text, messy layout' : NO_TEXT_NEG}. Heavy glare, extra logos.`;
 
   try {
     const out = await model.generateContent([{ role: 'user', parts: [{ text: sys + '\n' + user }]}]);
     return out.response.text().trim().replace(/\s+/g, ' ');
   } catch {
-    return `1:1 packshot of ${prod?.name || brandName}, replicate official logo shape/colors, ${themeText}, match references 80–99%, ${forceText ? `with big "${prod?.name || brandName}" text` : 'no text'}, clean studio background.`;
+    return `1:1 brand-authentic icon for ${prod?.name || brandName}, replicate official glyph and colors, ${themeText}, match references 80–99%, ${forceText ? `with big readable "${prod?.name || brandName}" text` : 'no text'}.`;
   }
 }
+
 
 
 // Accept refs and build parts accordingly
@@ -527,19 +590,16 @@ async function uploadImageBufferToSupabase(
 /* Title SVG (bigger, auto-scales) */
 function makeTextCardSvg(title = 'Product', subtitle = '') {
   const brand = getBrandStyle?.({ name: title }) || null;
-  const [c1, c2] = (brand?.palette?.length >= 2)
-    ? brand.palette.slice(0, 2)
-    : ['#0ea5e9', '#7c3aed'];
+  const [c1, c2] = (brand?.palette?.length >= 2) ? brand.palette.slice(0, 2) : ['#0ea5e9', '#7c3aed'];
 
   const esc = s => String(s || '').replace(/[<&>]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
   const tRaw = (title || '').trim();
-  const t = esc(tRaw).slice(0, 42);
-  const sub = esc(subtitle).slice(0, 60);
+  const t = esc(tRaw).slice(0, 48);
+  const sub = esc(subtitle).slice(0, 64);
 
-  // dynamic font size so it’s always big on the card
-  const len = tRaw.length || 1;
-  const size = Math.max(84, Math.min(150, 150 - Math.max(0, len - 12) * 3));
-
+  // Fit text to width: 880px area centered
+  // Start big then constrain with textLength to avoid clipping
+  const sizeGuess = Math.max(72, Math.min(140, 140 - Math.max(0, tRaw.length - 10) * 4));
   return `
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024">
   <defs>
@@ -548,22 +608,17 @@ function makeTextCardSvg(title = 'Product', subtitle = '') {
     </linearGradient>
   </defs>
   <rect width="1024" height="1024" fill="url(#g)"/>
-  <!-- subtle vignette to add depth, different from old circle -->
-  <radialGradient id="v" cx="50%" cy="40%" r="60%">
-    <stop offset="0%" stop-color="rgba(0,0,0,0.10)"/>
-    <stop offset="100%" stop-color="rgba(0,0,0,0)"/>
-  </radialGradient>
-  <rect width="1024" height="1024" fill="url(#v)"/>
-  <text x="50%" y="52%" fill="#fff" font-family="Segoe UI, Roboto, Arial"
-        font-size="${size}" font-weight="900" text-anchor="middle"
-        dominant-baseline="central" letter-spacing="0.5px">${t}</text>
-  ${sub ? `<text x="50%" y="64%" fill="rgba(255,255,255,0.92)" font-family="Segoe UI, Roboto, Arial"
-        font-size="48" text-anchor="middle">${sub}</text>` : ''}
+  <text x="72" y="560" fill="#fff" font-family="Segoe UI, Roboto, Arial"
+        font-size="${sizeGuess}" font-weight="900"
+        textLength="880" lengthAdjust="spacingAndGlyphs">${t}</text>
+  ${sub ? `<text x="72" y="640" fill="rgba(255,255,255,0.92)" font-family="Segoe UI, Roboto, Arial"
+        font-size="48" textLength="880" lengthAdjust="spacingAndGlyphs">${sub}</text>` : ''}
   <text x="96%" y="96%" fill="rgba(255,255,255,0.28)" font-family="Segoe UI, Roboto, Arial"
         font-size="40" text-anchor="end" stroke="#000" stroke-opacity=".25" stroke-width="2"
         transform="rotate(-8 900 900)">Harshportal</text>
 </svg>`.trim();
 }
+
 
 
 /** MAIN: generate image for a product with ref-match + watermark
@@ -591,7 +646,11 @@ const BRAND_DOMAIN_MAP = {
   'n8n': 'n8n.io',
   'magic patterns': 'magicpatterns.design',
   'wispr': 'wispr.cc', 'wispr flow': 'wispr.cc',
-  'windows': 'microsoft.com', 'windows 10': 'microsoft.com', 'windows 11': 'microsoft.com'
+  'windows': 'microsoft.com', 'windows 10': 'microsoft.com', 'windows 11': 'microsoft.com',
+  'v0': 'v0.dev',
+'v0.dev': 'v0.dev',
+'vercel v0': 'v0.dev',
+'vercel': 'vercel.com',
 };
 
 function resolveBrandDomain(name = '') {
@@ -677,7 +736,7 @@ async function ensureImageForProduct(prod, table, style = 'neo') {
   // 0) gather refs: brand refs → OG from pasted link (if any) → (optional) webSearchRefs
   const brandRefs = await fetchBrandRefs(prod?.name || prod?.title || '');
   const ogRef = prod?.og_image ? await fetchAsBase64(prod.og_image).catch(()=>null) : null;
-  const webRefs = []; // optionally: ...(await webSearchRefs(prod?.name || ''))
+  const webRefs = await webSearchRefs(prod?.name || '');
   const refBlobs = [...brandRefs, ...(ogRef ? [ogRef] : []), ...webRefs].slice(0,3);
 
   // 1) photoreal/brand-true packshot (no text)
@@ -1076,8 +1135,8 @@ bot.on('photo', async (ctx) => {
   const fileId = photos.at(-1)?.file_id;
   if (!fileId) return;
 
-  const fileLink = await ctx.telegram.getFileLink(fileId);
-  const href = typeof fileLink === 'string' ? fileLink : fileLink.href;
+  // use the stable Telegram URL
+  const href = await tgFileUrl(fileId);
 
   // EDIT MODE image
   if (ctx.session.awaitEdit === 'image' && ctx.session.review) {
@@ -1109,11 +1168,9 @@ bot.on('photo', async (ctx) => {
   // smart add photo
   if (ctx.session.mode === 'smart-photo') {
     ctx.session.smart.photo = await rehostToSupabase(href, 'prod.jpg', ctx.session.table);
-
     const prod = { ...ctx.session.smart.prod, image: ctx.session.smart.photo };
     const ai = await enrichWithAI(prod, ctx.session.smart.text, ctx.session.smart.og);
     ctx.session.review = { prod: { ...prod, tags: uniqMerge(prod.tags, ai.tags) }, ai, table: ctx.session.table };
-
     ctx.session.mode = null;
     return ctx.replyWithMarkdownV2(reviewMessage(ctx.session.review.prod, ai, ctx.session.table), kbConfirm);
   }
@@ -1132,6 +1189,78 @@ bot.on('photo', async (ctx) => {
     }
   }
 });
+
+
+// Accept images sent as "document" (PNG/WebP often arrive this way)
+bot.on('document', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+
+  const doc = ctx.message?.document;
+  if (!doc || !/^image\//i.test(doc.mime_type || '')) return;
+
+  const href = await tgFileUrl(doc.file_id);
+
+  // EDIT MODE
+  if (ctx.session.awaitEdit === 'image' && ctx.session.review) {
+    try {
+      const { table } = ctx.session.review;
+      const imgUrl = await rehostToSupabase(href, doc.file_name || 'prod.jpg', table);
+      ctx.session.review.prod.image = imgUrl;
+      ctx.session.awaitEdit = null;
+      const { prod, ai } = ctx.session.review;
+      await ctx.replyWithMarkdownV2(reviewMessage(prod, ai, table), kbConfirm);
+    } catch (e) {
+      console.error('edit image upload error (doc):', e);
+      await ctx.reply(`❌ Could not update image. ${e?.message || ''}\nPaste a direct image URL if it keeps failing.`);
+    }
+    return;
+  }
+
+  // manual wizard
+  if (ctx.session.mode === 'manual-photo') {
+    try {
+      const imgUrl = await rehostToSupabase(href, doc.file_name || 'prod.jpg', ctx.session.table);
+      const prod = ctx.session.form.prod;
+      prod.image = imgUrl;
+      const ai = await enrichWithAI(prod, '', {});
+      ctx.session.review = { prod, ai, table: ctx.session.table };
+      return ctx.replyWithMarkdownV2(reviewMessage(prod, ai, ctx.session.table), kbConfirm);
+    } catch (e) {
+      console.error('manual photo upload error (doc):', e);
+      return ctx.reply(`❌ Could not upload that image. ${e?.message || ''}`);
+    }
+  }
+
+  // smart add
+  if (ctx.session.mode === 'smart-photo') {
+    try {
+      ctx.session.smart.photo = await rehostToSupabase(href, doc.file_name || 'prod.jpg', ctx.session.table);
+      const prod = { ...ctx.session.smart.prod, image: ctx.session.smart.photo };
+      const ai = await enrichWithAI(prod, ctx.session.smart.text, ctx.session.smart.og);
+      ctx.session.review = { prod: { ...prod, tags: uniqMerge(prod.tags, ai.tags) }, ai, table: ctx.session.table };
+      ctx.session.mode = null;
+      return ctx.replyWithMarkdownV2(reviewMessage(ctx.session.review.prod, ai, ctx.session.table), kbConfirm);
+    } catch (e) {
+      console.error('smart photo upload error (doc):', e);
+      return ctx.reply(`❌ Could not upload that image. ${e?.message || ''}`);
+    }
+  }
+
+  // bulk
+  if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && ctx.session.await === 'image') {
+    try {
+      const imgUrl = await rehostToSupabase(href, doc.file_name || 'prod.jpg', ctx.session.table);
+      const idx = ctx.session.index || 0;
+      if (ctx.session.products?.[idx]) ctx.session.products[idx].image = imgUrl;
+      ctx.session.await = null;
+      return handleBulkStep(ctx);
+    } catch (e) {
+      console.error('bulk photo upload error (doc):', e);
+      return ctx.reply(`❌ Could not upload that image. ${e?.message || ''}`);
+    }
+  }
+});
+
 
 /* If smart add user types "skip" instead of photo -> ask to generate */
 bot.hears(/^skip$/i, async (ctx) => {
