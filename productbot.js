@@ -1477,9 +1477,10 @@ bot.action('save', async (ctx) => {
   }
 
   // Find which column to use
+const selectCols = table === TABLES.products ? 'id,image' : 'id,image_url';
   const { data: row, error: preErr } = await supabase
     .from(table)
-    .select('id, image, image_url')
+    .select(selectCols)
     .eq('id', Number(updateId))
     .maybeSingle();
 
@@ -1487,7 +1488,7 @@ bot.action('save', async (ctx) => {
     await ctx.reply(`❌ Can't load row ${updateId}: ${preErr?.message || 'not found'}`);
     return;
   }
-  const imgCol = ('image' in row) ? 'image' : (('image_url' in row) ? 'image_url' : null);
+  const imgCol = table === TABLES.products ? 'image' : 'image_url';
   if (!imgCol) {
     await ctx.reply('⚠️ No image column (`image` or `image_url`) found on this table.');
     return;
@@ -1533,10 +1534,10 @@ bot.action('save', async (ctx) => {
 
   // 2) Read-after-write to verify what’s actually saved
   const { data: fresh, error: readErr } = await supabase
-    .from(table)
-    .select(`id, ${imgCol}`)
-    .eq('id', Number(updateId))
-    .maybeSingle();
+   .from(table)
+   .select(`id, ${imgCol}`)
+   .eq('id', Number(updateId))
+   .maybeSingle();
 
   if (readErr) {
     console.log('[image:update] read-after-write error:', readErr);
