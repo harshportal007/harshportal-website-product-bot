@@ -743,6 +743,8 @@ function makeTextCardSvg(title = 'Product', subtitle = '') {
   // Fit text to width: 880px area centered
   // Start big then constrain with textLength to avoid clipping
   const sizeGuess = Math.max(72, Math.min(140, 140 - Math.max(0, tRaw.length - 10) * 4));
+  console.warn('Using SVG fallback (makeTextCardSvg)');
+
   return `
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024">
   <defs>
@@ -1016,21 +1018,21 @@ let buf = await generateProductImageBytes({
   }
   return await uploadImageBufferToSupabase(buf, { table, filename: 'ai.png', contentType: 'image/png' });
 } catch (e) {
-   console.warn('AI image generation failed, will try brand tile:', e?.message || e);
-   }
+  console.warn('AI image generation failed (Gemini). Cause:', e?.message || e);
+}
 
-  // 2) Deterministic brand tile fallback
-  try {
-    const deterministic = await composeBrandTile(prod, table);
-    if (deterministic) return deterministic;
-  } catch (e) {
-    console.warn('composeBrandTile failed:', e?.message || e);
-  }
+//   // 2) Deterministic brand tile fallback
+//   try {
+//     const deterministic = await composeBrandTile(prod, table);
+//     if (deterministic) return deterministic;
+//   } catch (e) {
+//     console.warn('composeBrandTile failed:', e?.message || e);
+//   }
 
- // 3) Last resort: SVG title card
-   const svg = makeTextCardSvg(prod?.name || 'Digital Product', prod?.plan || prod?.subcategory || '');
-   const svgBuf = Buffer.from(svg, 'utf8');
-   return uploadImageBufferToSupabase(svgBuf, { table, filename: 'ai.svg', contentType: 'image/svg+xml' });
+//  // 3) Last resort: SVG title card
+//    const svg = makeTextCardSvg(prod?.name || 'Digital Product', prod?.plan || prod?.subcategory || '');
+//    const svgBuf = Buffer.from(svg, 'utf8');
+//    return uploadImageBufferToSupabase(svgBuf, { table, filename: 'ai.svg', contentType: 'image/svg+xml' });
  }
 
 
