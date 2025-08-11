@@ -67,9 +67,11 @@ function normalizeCategoryFromText(text = '') {
   return null;
 }
 
+
 function normalizeCategory(prodLike = {}, aiCategory) {
   // 1) already allowed?
   if (CATEGORIES_ALLOWED.includes(aiCategory)) return aiCategory;
+
 
   const hay = [
     prodLike.name, prodLike.description, prodLike.category, prodLike.subcategory,
@@ -88,7 +90,8 @@ function normalizeCategory(prodLike = {}, aiCategory) {
 async function tgFileUrl(fileId) {
   try {
     const f = await bot.telegram.getFile(fileId); // { file_path: '...' }
-    return `https://api.telegram.org/file/bot${bot.token}/${f.file_path}`;
+      const token = process.env.TELEGRAM_BOT_TOKEN;
+    return `https://api.telegram.org/file/bot${token}/${f.file_path}`;
   } catch {
     const link = await bot.telegram.getFileLink(fileId);
     return typeof link === 'string' ? link : link.toString();
@@ -119,7 +122,10 @@ function guessMime(buf, filenameHint='') {
 
 
 /* --------------- OpenGraph hinting from URLs --------------- */
-const findUrls = (txt = '') => (txt.match(/https?:\/\/\S+/gi) || []).slice(0, 5);
+const findUrls = (txt = '') =>
+  (txt.match(/https?:\/\/\S+/gi) || [])
+    .map(u => u.replace(/[),.\]]+$/,''))
+    .slice(0, 5);
 
 async function getOG(url) {
   const ac = new AbortController();
@@ -277,16 +283,12 @@ const BRAND_STYLES = [
 
 
 function getBrandStyle(prod) {
-  const hay = [
-    prod?.name, prod?.description, prod?.category, prod?.subcategory,
-    Array.isArray(prod?.tags) ? prod.tags.join(' ') : prod?.tags
-  ].filter(Boolean).join(' ').toLowerCase();
-
-  for (const b of BRAND_STYLES) {
-    if (b.match.test(hay)) return b;
-  }
-  return null;
+  const tags = Array.isArray(prod?.tags) ? prod.tags.join(' ') : (prod?.tags || '');
+  const hay = [prod?.name, prod?.description, prod?.category, prod?.subcategory, tags]
+    .filter(Boolean).join(' ').toLowerCase();
+  return BRAND_STYLES.find(b => b.match.test(hay)) || null;
 }
+
 
 
 // Brand icon "recipes" to force real look (rounded-square app icon style)
@@ -556,7 +558,7 @@ async function buildImagePrompt(prod, styleName = 'neo', wantPromptWatermark = f
   const model = genAI.getGenerativeModel({ model: TEXT_MODEL });
   const themeText = STYLE_THEMES[styleName] || STYLE_THEMES.neo;
   const brand = getBrandStyle(prod);
- const brandName = shortBrandName(prod);
+  const brandName = shortBrandName(prod);
   const palette = brand?.palette?.join(', ') || 'brand-accurate colors';
   const brandHints = brand?.keywords || 'official logomark proportions';
 
@@ -567,14 +569,12 @@ Layout:
 - large logo centered
 - short brand/product name beneath the logo in bold, clean sans-serif
 - keep at least 10% padding from every edge
-No borders. No extra iconography. Do NOT invent a new logo.`;
+No borders. No extra iconography. Do NOT invent a new logo.`.trim();
 
-
-const recipe = brandRecipe(prod);
-const motif = recipe
-  ? `Visual recipe: ${recipe.describe}. Background ${recipe.bg}, logo color ${recipe.fg}.`
-  : brandHints;
-
+  const recipe = brandRecipe(prod);
+  const motif = recipe
+    ? `Visual recipe: ${recipe.describe}. Background ${recipe.bg}, logo color ${recipe.fg}.`
+    : brandHints;
 
   const user = `
 Product:
@@ -590,16 +590,18 @@ Rules:
 - Avoid generic gradient circles; vary the look per brand.
 ${wantPromptWatermark ? 'Add a tiny bottom-right watermark text: "Harshportal".' : ''}
 
-Negative: placeholder blobs, tiny/cropped text, extra logos, heavy glare, borders, watermarks (unless requested).`;
+Negative: placeholder blobs, tiny/cropped text, extra logos, heavy glare, borders, watermarks (unless requested).`.trim();
 
   try {
-    const out = await model.generateContent([{ role: 'user', parts: [{ text: sys + '\n' + user }]}]);
+    const out = await model.generateContent({
+  contents: [{ role: 'user', parts: [{ text: sys + '\n\n' + user }]}]
+});
     return out.response.text().trim().replace(/\s+/g, ' ');
   } catch {
     return `Brand-accurate 1:1 tile for ${brandName}; large centered official logo; readable brand name under it; ${themeText}; match references 80–99%; no borders.`;
   }
-
 }
+
 
 
 
@@ -609,9 +611,11 @@ async function generateImageOpenAI({ prompt, size = '1024x1024' }) {
     prompt,
     size,
   });
-  const b64 = out.data[0].b64_json;
+  const b64 = out.data?.[0]?.b64_json;
+  if (!b64) throw new Error('OpenAI did not return an image');
   return Buffer.from(b64, 'base64'); // PNG buffer
 }
+
 
 function bgOnlyPromptFrom(prompt) {
   return `${prompt}
@@ -633,6 +637,17 @@ async function generateBackgroundWithOpenAI(prompt) {
   return Buffer.from(b64, 'base64');
 }
 
+// --- tiny timeout helper (no AbortSignal needed) ---
+function withTimeout(ms) {
+  let timer = null;
+  const p = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`AI call timed out after ${ms}ms`)), ms);
+  });
+  return {
+    race: (promise) => Promise.race([promise, p]),
+    clear: () => timer && clearTimeout(timer),
+  };
+}
 
 // Accept refs and build parts accordingly
 async function generateProductImageBytes({ prompt, refImages = [], brandName }) {
@@ -668,22 +683,35 @@ async function generateProductImageBytes({ prompt, refImages = [], brandName }) 
   const safePrompt = String(prompt || '');
   parts.push({ text: safePrompt });
 
-  for (const id of candidates) {
-    try {
-      const model = genAI.getGenerativeModel({ model: id });
-      const res = await model.generateContent({
+for (const id of candidates) {
+  try {
+    const model = genAI.getGenerativeModel({ model: id });
+    const t = withTimeout(20000); // 20s per attempt
+
+    const res = await t.race(
+      model.generateContent({
         contents: [{ role: 'user', parts }],
         generationConfig: { temperature: 0.2, responseModalities: ['TEXT', 'IMAGE'] },
-      });
-      const prts = res.response?.candidates?.[0]?.content?.parts ?? [];
-      const imagePart = prts.find(p => p.inlineData && p.inlineData.data);
-      if (!imagePart) throw new Error('No inline image returned');
-      return Buffer.from(imagePart.inlineData.data, 'base64');
-    } catch (e) {
-      lastErr = e;
-      console.warn(`Image model "${id}" failed:`, e?.message || e);
-    }
+      })
+    );
+    t.clear();
+
+    const prts = res.response?.candidates?.[0]?.content?.parts ?? [];
+    const imagePart =
+      prts.find(p => p.inlineData && p.inlineData.data) ||
+      prts.find(p => p.media && p.media.data);
+    if (!imagePart) throw new Error('No inline image returned');
+
+    return Buffer.from(
+      imagePart.inlineData?.data || imagePart.media.data,
+      'base64'
+    );
+  } catch (e) {
+    lastErr = e;
+    console.warn(`Image model "${id}" failed:`, e?.message || e);
   }
+}
+
   const err = new Error('All image models failed');
   err.cause = lastErr;
   throw err;
@@ -969,16 +997,9 @@ async function ensureImageForProduct(prod, table, style = 'neo') {
   const ogRef = prod?.og_image ? await fetchAsBase64(prod.og_image).catch(() => null) : null;
   const refBlobs = [...brandRefs, ...(ogRef ? [ogRef] : [])].slice(0, 3);
 
-    try {
-    const deterministic = await composeBrandTile(prod, table);
-    if (deterministic) return deterministic;
-  } catch (e) {
-    console.warn('composeBrandTile failed:', e?.message || e);
-  }
-
-  // 1) Brand-true logo tile (with name)
+    // 1) Try photoreal / brand-true AI image first
   try {
- const prompt = await buildImagePrompt(prod, style, !_sharp);
+   const prompt = await buildImagePrompt(prod, style, !_sharp);
 const brandName = shortBrandName(prod);
 let buf = await generateProductImageBytes({
   prompt,            // <= add this
@@ -994,15 +1015,22 @@ let buf = await generateProductImageBytes({
   }
   return await uploadImageBufferToSupabase(buf, { table, filename: 'ai.png', contentType: 'image/png' });
 } catch (e) {
-  console.warn('brand tile generation failed:', e?.message || e);
-}
+   console.warn('AI image generation failed, will try brand tile:', e?.message || e);
+   }
 
-  // 2) Guaranteed fallback: big readable title SVG (brand colors) + watermark baked in SVG
-  const svg = makeTextCardSvg(prod?.name || 'Digital Product', prod?.plan || prod?.subcategory || '');
-  const svgBuf = Buffer.from(svg, 'utf8');
-  return uploadImageBufferToSupabase(svgBuf, { table, filename: 'ai.svg', contentType: 'image/svg+xml' });
-}
+  // 2) Deterministic brand tile fallback
+  try {
+    const deterministic = await composeBrandTile(prod, table);
+    if (deterministic) return deterministic;
+  } catch (e) {
+    console.warn('composeBrandTile failed:', e?.message || e);
+  }
 
+ // 3) Last resort: SVG title card
+   const svg = makeTextCardSvg(prod?.name || 'Digital Product', prod?.plan || prod?.subcategory || '');
+   const svgBuf = Buffer.from(svg, 'utf8');
+   return uploadImageBufferToSupabase(svgBuf, { table, filename: 'ai.svg', contentType: 'image/svg+xml' });
+ }
 
 
 /* --------------------- /style command --------------------- */
@@ -1023,7 +1051,7 @@ bot.action(/^style_set_(.+)$/, (ctx) => {
   if (!STYLE_THEMES[pick]) return ctx.answerCbQuery('Unknown style');
   ctx.session.style = pick;
   ctx.answerCbQuery('Style updated');
-  ctx.reply(`🎨 Style set to *${pick}*`, { parse_mode: 'Markdown' });
+  ctx.reply(escapeMd(`🎨 Style set to ${pick}`), { parse_mode: 'MarkdownV2' });
 });
 
 /* --------------- keyboards / messages --------------- */
@@ -1205,9 +1233,16 @@ bot.on('text', async (ctx, next) => {
     if (t === 'products' || t === 'exclusive') {
       ctx.session.table = t === 'exclusive' ? TABLES.exclusive : TABLES.products;
       return ctx.reply(
-        `Table set to *${ctx.session.table}*.\nCommands:\n• /addproduct (manual)\n• /addproductgemini (AI bulk)\n• /smartadd (one-shot messy add)\n• /list  • /toggle <id>  • /update <id>`,
-        { parse_mode: 'Markdown' }
-      );
+  escapeMd(
+    `Table set to ${ctx.session.table}.
+Commands:
+• /addproduct (manual)
+• /addproductgemini (AI bulk)
+• /smartadd (one-shot messy add)
+• /list  • /toggle <id>  • /update <id>`
+  ),
+  { parse_mode: 'MarkdownV2' }
+);
     }
     return ctx.reply('Type *products* or *exclusive*', { parse_mode: 'Markdown' });
   }
@@ -1476,15 +1511,16 @@ if (updateId) {
     try { prod.image = await ensureHostedInSupabase(prod.image, table); } catch {}
   }
 
-  const idNum  = Number(updateId);
-  const imgCol = table === TABLES.products ? 'image' : 'image_url';
+ const idKey  = updateId; // keep as string to support UUIDs
+ const imgCol = table === TABLES.products ? 'image' : 'image_url';
 
-  // 1) IMAGE ONLY — no .select() here
-  console.log('[save] about to write', table, idNum, 'imgCol=', imgCol, 'value=', prod.image);
+ // 1) IMAGE ONLY — no .select() here
+ console.log('[save] about to write', table, idKey, 'imgCol=', imgCol, 'value=', prod.image);
+
   const { error: imgWriteErr } = await supabase
     .from(table)
     .update({ [imgCol]: prod.image || null })
-    .eq('id', idNum);
+    .eq('id', idKey);
   if (imgWriteErr) {
     await ctx.reply(`❌ Image update failed: ${imgWriteErr.message}`);
     return;
@@ -1493,13 +1529,12 @@ if (updateId) {
   // 2) Read-after-write (separate select)
   const { data: fresh, error: readErr } = await supabase
     .from(table)
-    .select(`id, ${imgCol}`)
-    .eq('id', idNum)
+    .select(`id, ${imgCol}`).eq('id', idKey)
     .maybeSingle();
   if (readErr) {
     console.log('[image:readback] error:', readErr);
   } else {
-    console.log('[image:readback]', table, idNum, '->', imgCol, fresh?.[imgCol]);
+    console.log('[image:readback]', table, idKey, '->', imgCol, fresh?.[imgCol]);
   }
 
   // 3) Update the rest (avoid touching image column again)
@@ -1526,7 +1561,7 @@ if (updateId) {
         tags: mergedTags,
       };
 
-  const { error: restErr } = await supabase.from(table).update(rest).eq('id', idNum);
+  const { error: restErr } = await supabase.from(table).update(rest).eq('id', idKey);
   if (restErr) {
     await ctx.reply(`❌ Update failed: ${restErr.message}`);
     return;
@@ -1537,8 +1572,9 @@ if (updateId) {
 
   ctx.session.review = null;
   if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && Array.isArray(ctx.session.products)) {
-    return handleBulkStep(ctx);
-  }
+  ctx.session.index = (ctx.session.index || 0) + 1; // move pointer now
+  return handleBulkStep(ctx);
+}
   ctx.session.mode = null;
   return;
 }
@@ -1808,10 +1844,13 @@ async function handleBulkStep(ctx) {
   }
 
   ctx.session.review = { prod, ai: prod._ai, table };
-  await ctx.replyWithMarkdownV2(reviewMessage(prod, prod._ai, table), kbConfirm);
+await ctx.replyWithMarkdownV2(reviewMessage(prod, prod._ai, table), kbConfirm);
 
-  ctx.session.index = idx + 1;
-  ctx.session.await = null;
+// ➜ advance to the next item now, so after "Save" we move on
+ctx.session.index = idx + 1;
+
+ctx.session.await = null;
+
 }
 
 /* --------------------- errors & launch --------------------- */
