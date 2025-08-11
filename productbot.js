@@ -2,9 +2,7 @@ require('dotenv').config();
 const { Telegraf, session, Markup } = require('telegraf');
 const { createClient } = require('@supabase/supabase-js');
 const fetch = globalThis.fetch ?? ((...a) => import('node-fetch').then(({ default: f }) => f(...a)));
-const { GoogleGenerativeAI } = require('@google/generative-ai'); // ✅ keep
-const OpenAI = require('openai');
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const ADMIN_IDS = (process.env.ADMIN_IDS || '7057639075')
   .split(',').map(s => Number(s.trim())).filter(Boolean);
@@ -13,7 +11,7 @@ const TABLES = { products: 'products', exclusive: 'exclusive_products' };
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY); // ✅ keep
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const CATEGORIES_ALLOWED = ['OTT Accounts', 'IPTV', 'Product Key', 'Download'];
 const categories = CATEGORIES_ALLOWED;
@@ -22,7 +20,6 @@ const categories = CATEGORIES_ALLOWED;
 const isAdmin = (ctx) => ADMIN_IDS.includes(ctx.from.id);
 const ok = (x) => typeof x !== 'undefined' && x !== null && x !== '';
 
-// Convert any value to string safely (prevents s.replace crash)
 const toStr = (v) => {
   if (v == null) return '';
   if (typeof v === 'string') return v;
@@ -31,13 +28,11 @@ const toStr = (v) => {
   return String(v);
 };
 
-const TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-flash';
+const TEXT_MODEL = (process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-pro').trim();
 const DEFAULT_IMAGE_MODEL =
   (process.env.GEMINI_IMAGE_MODEL && process.env.GEMINI_IMAGE_MODEL.trim()) ||
   'gemini-2.0-flash-preview-image-generation';
 
-
-// Escape MarkdownV2 for Telegram safely
 const escapeMd = (v = '') => toStr(v).replace(/([_\*\[\]\(\)~`>#+\-=|{}\.!])/g, '\\$1');
 
 function safeParseFirstJsonObject(s) {
@@ -48,7 +43,6 @@ function safeParseFirstJsonObject(s) {
   try { return JSON.parse(m[0]); } catch { return null; }
 }
 
-
 const parsePrice = (raw) => {
   if (!raw) return null;
   const m = String(raw).match(/(\d[\d,\.]*)/);
@@ -56,14 +50,12 @@ const parsePrice = (raw) => {
   return Math.round(parseFloat(m[1].replace(/,/g, '')));
 };
 
-/** Merge arrays without dupes, normalized */
 const uniqMerge = (...arrs) => {
   const set = new Set();
   arrs.flat().filter(Boolean).forEach(x => set.add(String(x).trim()));
   return Array.from(set).filter(Boolean);
 };
 
-// maps fuzzy terms → one of the allowed categories
 const CATEGORY_RULES = [
   { rx: /(iptv|live\s*tv)/i, to: 'IPTV' },
   { rx: /(product\s*key|license|licen[cs]e|activation|serial)/i, to: 'Product Key' },
@@ -76,30 +68,25 @@ function normalizeCategoryFromText(text = '') {
   return null;
 }
 
-
 function normalizeCategory(prodLike = {}, aiCategory) {
-  // 1) already allowed?
   if (CATEGORIES_ALLOWED.includes(aiCategory)) return aiCategory;
-
 
   const hay = [
     prodLike.name, prodLike.description, prodLike.category, prodLike.subcategory,
     Array.isArray(prodLike.tags) ? prodLike.tags.join(' ') : prodLike.tags
   ].filter(Boolean).join(' ');
 
-  // 2) infer from content
   const inferred = normalizeCategoryFromText(hay) || normalizeCategoryFromText(aiCategory || '');
   if (inferred) return inferred;
 
-  // 3) safe default
   return 'Download';
 }
 
-// Reliable Telegram file URL for both photos and documents
+// Telegram file URL helper
 async function tgFileUrl(fileId) {
   try {
-    const f = await bot.telegram.getFile(fileId); // { file_path: '...' }
-      const token = process.env.TELEGRAM_BOT_TOKEN;
+    const f = await bot.telegram.getFile(fileId);
+    const token = process.env.TELEGRAM_BOT_TOKEN;
     return `https://api.telegram.org/file/bot${token}/${f.file_path}`;
   } catch {
     const link = await bot.telegram.getFileLink(fileId);
@@ -114,7 +101,7 @@ function guessMime(buf, filenameHint='') {
   const isPNG  = head[0]===0x89 && head[1]===0x50 && head[2]===0x4E && head[3]===0x47;
   const isJPG  = head[0]===0xFF && head[1]===0xD8 && head[2]===0xFF;
   const isRIFF = head[0]===0x52 && head[1]===0x49 && head[2]===0x46 && head[3]===0x46 &&
-                 head[8]===0x57 && head[9]===0x45 && head[10]===0x42 && head[11]===0x50; // WEBP
+                 head[8]===0x57 && head[9]===0x45 && head[10]===0x42 && head[11]===0x50;
 
   if (isPNG) return { mime: 'image/png', ext: 'png' };
   if (isJPG) return { mime: 'image/jpeg', ext: 'jpg' };
@@ -128,10 +115,7 @@ function guessMime(buf, filenameHint='') {
   return { mime: 'image/jpeg', ext: 'jpg' };
 }
 
-
-
-
-/* --------------- OpenGraph hinting from URLs --------------- */
+/* --------------- OpenGraph --------------- */
 const findUrls = (txt = '') =>
   (txt.match(/https?:\/\/\S+/gi) || [])
     .map(u => u.replace(/[),.\]]+$/,''))
@@ -160,72 +144,58 @@ async function getOG(url) {
   } finally { clearTimeout(t); }
 }
 
-
 function isSupabasePublicUrl(u='') {
   try {
     const url = new URL(u);
     const base = new URL(process.env.SUPABASE_URL);
-    // true for {your}.supabase.co/storage/v1/object/public/<bucket>/...
     return url.hostname === base.hostname && /\/storage\/v1\/object\/public\//.test(url.pathname);
   } catch { return false; }
 }
 
 async function ensureHostedInSupabase(u, table, filenameHint='prod.jpg') {
-  if (!u || !/^https?:\/\//i.test(u)) return u;       // not a URL → nothing to do
-  if (isSupabasePublicUrl(u)) return u;               // already in your storage
-  return rehostToSupabase(u, filenameHint, table);    // rehost external URL
+  if (!u || !/^https?:\/\//i.test(u)) return u;
+  if (isSupabasePublicUrl(u)) return u;
+  return rehostToSupabase(u, filenameHint, table);
 }
 
-
-/* --------------- Supabase Storage (unchanged) --------------- */
+/* --------------- Supabase Storage --------------- */
 async function rehostToSupabase(fileUrl, filenameHint = 'image.jpg', table) {
   try {
     const res = await fetch(fileUrl);
     if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
 
-    // choose bucket/folder
     const bucket = table === TABLES.products
       ? (process.env.SUPABASE_BUCKET_PRODUCTS || 'images')
       : (process.env.SUPABASE_BUCKET_EXCLUSIVE || 'exclusiveproduct-images');
     const folder = table === TABLES.products ? 'products' : 'exclusive-products';
 
-    // decide mime/ext
     const headerCT = (res.headers.get('content-type') || '').toLowerCase();
     let { mime, ext } = guessMime(buf, filenameHint);
     if (headerCT.startsWith('image/') && headerCT !== 'application/octet-stream') {
-      // trust real image content-types from upstream, otherwise keep our guess
       mime = headerCT;
       ext  = headerCT.includes('png') ? 'png'
           : headerCT.includes('webp') ? 'webp'
           : headerCT.includes('svg') ? 'svg' : 'jpg';
     }
 
-    // make filename match the mime we’ll store
     const base = filenameHint.replace(/\.[A-Za-z0-9]+$/, '');
     const safeName = `${base}.${ext}`;
     const key = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2)}-${safeName}`;
-
-    console.log('[upload] bucket=', bucket, 'key=', key, 'mime=', mime);
 
     const { error: upErr } = await supabase.storage.from(bucket).upload(key, buf, {
       contentType: mime,
       upsert: true,
     });
-    if (upErr) {
-      console.error('[upload] error', upErr);
-      throw upErr;
-    }
+    if (upErr) throw upErr;
 
     const { data: pub } = supabase.storage.from(bucket).getPublicUrl(key);
-    console.log('[upload] publicUrl=', pub?.publicUrl);
     return pub.publicUrl;
   } catch (e) {
     console.error('Rehost failed:', e.message);
     throw e;
   }
 }
-
 
 /* ---------------- Brand & Style helpers ---------------- */
 const STYLE_THEMES = {
@@ -237,60 +207,18 @@ const STYLE_THEMES = {
 };
 
 const BRAND_STYLES = [
-  {
-    match: /\bspotify\b/i,
-    name: 'Spotify',
-    palette: ['#1DB954', '#121212', '#1e1e1e'],
-    keywords: 'music streaming, circular equalizer, waveform rings, rounded icon silhouette'
-  },
-  {
-    match: /\bnetflix\b/i,
-    name: 'Netflix',
-    palette: ['#E50914', '#0B0B0B'],
-    keywords: 'cinematic streaming, widescreen frame, ribbon arc, spotlight vignette'
-  },
-
-{
-  match: /\bv0(\.dev)?|\bvercel\b/i,
-  name: 'Vercel v0',
-  palette: ['#0b0b0b', '#111111', '#ffffff'],
-  keywords: 'minimal monochrome, rounded square tile, official v0 glyph, black background, white logomark'
-},
-
-  {
-    match: /\byou ?tube|yt ?premium\b/i,
-    name: 'YouTube',
-    palette: ['#FF0000', '#FFFFFF', '#0f0f0f'],
-    keywords: 'play triangle motif, video tile grid, glossy rounded icon silhouette'
-  },
-  {
-    match: /\bprime|amazon prime\b/i,
-    name: 'Prime Video',
-    palette: ['#00A8E1', '#0B0B0B', '#0a2533'],
-    keywords: 'streaming, arc swoosh, cinematic glow'
-  },
-  {
-    match: /\bdisney\b/i,
-    name: 'Disney+',
-    palette: ['#0d3df2', '#0b0b0b', '#1a73e8'],
-    keywords: 'night sky arc, starlight sparkles, smooth blue glow'
-  },
-  {
-    match: /\biptv\b/i,
-    name: 'IPTV',
-    palette: ['#00E0FF', '#141414', '#00FFA3'],
-    keywords: 'channel mosaic, antenna waves, signal bars, modern tv glyph'
-  },
+  { match: /\bspotify\b/i, name: 'Spotify', palette: ['#1DB954', '#121212', '#1e1e1e'], keywords: '' },
+  { match: /\bnetflix\b/i, name: 'Netflix', palette: ['#E50914', '#0B0B0B'], keywords: '' },
+  { match: /\bv0(\.dev)?|\bvercel\b/i, name: 'Vercel v0', palette: ['#0b0b0b', '#111111', '#ffffff'], keywords: '' },
+  { match: /\byou ?tube|yt ?premium\b/i, name: 'YouTube', palette: ['#FF0000', '#FFFFFF', '#0f0f0f'], keywords: '' },
+  { match: /\bprime|amazon prime\b/i, name: 'Prime Video', palette: ['#00A8E1', '#0B0B0B', '#0a2533'], keywords: '' },
+  { match: /\bdisney\b/i, name: 'Disney+', palette: ['#0d3df2', '#0b0b0b', '#1a73e8'], keywords: '' },
+  { match: /\biptv\b/i, name: 'IPTV', palette: ['#00E0FF', '#141414', '#00FFA3'], keywords: '' },
   {
     match: /\bspotify|netflix|youtube|yt|prime|amazon|disney|iptv|hbo|hotstar|zee|sonyliv|hulu|paramount\b/i,
-    // generic streaming palette if we hit other OTT names
-    name: 'OTT',
-    palette: ['#00FFC6', '#0B0B0B', '#7C4DFF'],
-    keywords: 'abstract tv glyph, play icons, cinematic glow'
+    name: 'OTT', palette: ['#00FFC6', '#0B0B0B', '#7C4DFF'], keywords: ''
   },
 ];
-
-
 
 function getBrandStyle(prod) {
   const tags = Array.isArray(prod?.tags) ? prod.tags.join(' ') : (prod?.tags || '');
@@ -299,34 +227,13 @@ function getBrandStyle(prod) {
   return BRAND_STYLES.find(b => b.match.test(hay)) || null;
 }
 
-
-
-// Brand icon "recipes" to force real look (rounded-square app icon style)
 const BRAND_ICON_RECIPES = {
-  spotify: {
-    bg: '#121212', fg: '#1DB954',
-    describe: 'rounded-square black app icon, centered green circle with three horizontal curved bars (audio waves)'
-  },
-  netflix: {
-    bg: '#0B0B0B', fg: '#E50914',
-    describe: 'rounded-square black app icon, centered red ribbon N monogram with diagonal fold'
-  },
-  youtube: {
-    bg: '#0f0f0f', fg: '#FF0000',
-    describe: 'rounded-square dark app icon, centered red rounded rectangle with white play triangle'
-  },
-  'v0': {
-    bg: '#0b0b0b', fg: '#ffffff',
-    describe: 'rounded-square pure black tile, minimalist white v0 monogram glyph'
-  },
-  raycast: {
-    bg: '#0b0b0b', fg: '#FF6363',
-    describe: 'rounded-square black tile, centered coral asterisk-like raycast glyph made of 4 bars'
-  },
-  warp: {
-    bg: '#0b0b0b', fg: '#7C4DFF',
-    describe: 'rounded-square black tile, centered angular W ribbon glyph in purple'
-  }
+  spotify: { bg: '#121212', fg: '#1DB954', describe: '' },
+  netflix: { bg: '#0B0B0B', fg: '#E50914', describe: '' },
+  youtube: { bg: '#0f0f0f', fg: '#FF0000', describe: '' },
+  'v0':    { bg: '#0b0b0b', fg: '#ffffff', describe: '' },
+  raycast: { bg: '#0b0b0b', fg: '#FF6363', describe: '' },
+  warp:    { bg: '#0b0b0b', fg: '#7C4DFF', describe: '' }
 };
 
 function brandRecipe(prod) {
@@ -337,7 +244,7 @@ function brandRecipe(prod) {
   return null;
 }
 
-/* ---------------- NEW: small helpers for refs + watermark ---------------- */
+/* --- refs & watermark helpers --- */
 async function fetchAsBase64(url) {
   try {
     const res = await fetch(url);
@@ -350,7 +257,6 @@ async function fetchAsBase64(url) {
     return null;
   }
 }
-
 
 let canSvgText = true;
 
@@ -367,8 +273,6 @@ async function tryCompositeSvg(baseBuf, svgBuf, opts={}) {
   }
 }
 
-
-// optional watermark with sharp; fall back to prompt watermark
 let _sharp = null;
 try { _sharp = require('sharp'); } catch {}
 
@@ -390,21 +294,38 @@ async function addWatermarkToBuffer(buf, text = 'Harshportal') {
     .toBuffer();
 }
 
+/* ---------------- Gemini caller with retry ---------------- */
+async function callGeminiWithRetry(modelId, contentsOrPrompt, genCfg = {}, tries = 3) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const model = genAI.getGenerativeModel({ model: modelId });
+      const payload = typeof contentsOrPrompt === 'string'
+        ? { contents: [{ role: 'user', parts: [{ text: contentsOrPrompt }]}], generationConfig: genCfg }
+        : { contents: [{ role: 'user', parts: contentsOrPrompt }], generationConfig: genCfg };
+      return await model.generateContent(payload);
+    } catch (e) {
+      const msg = String(e?.message || e);
+      if (/hard limit|permission|API key|quota/i.test(msg)) throw e;
+      lastErr = e;
+      await new Promise(r => setTimeout(r, 600 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
 
-
-/* ---------------- AI enrichment (unchanged logic) ---------------- */
+/* ---------------- AI enrichment ---------------- */
 async function enrichWithAI(prod, textHints = '', ogHints = {}) {
-  const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
-  const brand = getBrandStyle?.(prod); // optional: from your brand helpers
+  const brand = getBrandStyle?.(prod);
 
   const prompt = `
 You are a product data normalizer. Fix misspellings, normalize brands, infer likely plan/validity,
-and return compact JSON. Do NOT invent prices. If unsure, use "unknown" (not empty).
-Keep "description" <= 220 chars. Also extract 3–6 short "features" (bullet-style phrases).
+and return compact JSON. Do NOT invent prices. If unsure, use "unknown".
+Keep "description" <= 220 chars. Also extract 3–6 short "features".
 
 Given:
 - Raw product JSON: ${JSON.stringify(prod)}
-- Extra text (can be messy): """${textHints}"""
+- Extra text: """${textHints}"""
 - OpenGraph hints: ${JSON.stringify(ogHints)}
 - Allowed categories: ${categories.join(' | ')}
 
@@ -421,51 +342,42 @@ Return ONLY JSON:
   "features": ["3-6 concise bullet phrases"],
   "gradient": ["#hex1","#hex2"]
 }
-`;
+`.trim();
 
   try {
-  const out = await model.generateContent(prompt);
-  const text = out.response.text().trim();
-  const json = safeParseFirstJsonObject(text) || {};
+    const out = await callGeminiWithRetry(TEXT_MODEL, prompt);
+    const text = out.response.text().trim();
+    const json = safeParseFirstJsonObject(text) || {};
 
-  // Clean + coerce
-  json.name = (json.name || prod.name || '').toString().trim();
-  json.description = (json.description || prod.description || '').toString().trim();
-  if (json.price !== 'unknown') json.price = parsePrice(json.price);
+    json.name = (json.name || prod.name || '').toString().trim();
+    json.description = (json.description || prod.description || '').toString().trim();
+    if (json.price !== 'unknown') json.price = parsePrice(json.price);
 
-  // clamp to allowed categories
-  json.category = normalizeCategory({ ...prod, ...json }, json.category);
+    json.category = normalizeCategory({ ...prod, ...json }, json.category);
+    json.tags = Array.isArray(json.tags) ? json.tags.slice(0, 8) : [];
 
-  json.tags = Array.isArray(json.tags) ? json.tags.slice(0, 8) : [];
+    let feats = Array.isArray(json.features) ? json.features : [];
+    if (!feats.length && textHints) {
+      feats = String(textHints)
+        .split(/\n|[;•·\-–—]\s+/g).map(s => s.trim())
+        .filter(s => s.length > 3 && s.length <= 80).slice(0, 6);
+    }
+    json.features = feats
+      .map(s => s.replace(/^[\-\*\•\•–—]\s*/, '').trim())
+      .filter(Boolean).slice(0, 6);
 
-  // Features (normalize to 3–6 short items)
-  let feats = Array.isArray(json.features) ? json.features : [];
-  if (!feats.length && textHints) {
-    feats = String(textHints)
-      .split(/\n|[;•·\-–—]\s+/g)
-      .map(s => s.trim())
-      .filter(s => s.length > 3 && s.length <= 80)
-      .slice(0, 6);
-  }
-  json.features = feats
-    .map(s => s.replace(/^[\-\*\•\•–—]\s*/, '').trim())
-    .filter(Boolean)
-    .slice(0, 6);
+    const palette = (brand?.palette && brand.palette.length >= 2)
+      ? brand.palette.slice(0, 2)
+      : ['#0ea5e9', '#7c3aed'];
+    if (!Array.isArray(json.gradient) || json.gradient.length < 2) {
+      json.gradient = palette;
+    } else {
+      json.gradient = json.gradient.slice(0, 2);
+    }
 
-  // Gradient fallback
-  const palette = (brand?.palette && brand.palette.length >= 2)
-    ? brand.palette.slice(0, 2)
-    : ['#0ea5e9', '#7c3aed'];
-  if (!Array.isArray(json.gradient) || json.gradient.length < 2) {
-    json.gradient = palette;
-  } else {
-    json.gradient = json.gradient.slice(0, 2);
-  }
-
-  return json;
-} catch (e) {
+    return json;
+  } catch (e) {
     console.error('AI enrich error:', e.message);
-    // Safe fallback
     const palette = (getBrandStyle?.(prod)?.palette?.slice(0,2)) || ['#0ea5e9','#7c3aed'];
     return {
       name: prod.name || '',
@@ -482,38 +394,38 @@ Return ONLY JSON:
   }
 }
 
-/** For messy freeform message → product JSON */
+/** extract single product from freeform */
 async function extractFromFreeform(text) {
-  const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
   const prompt = `
-Extract a single product from this freeform text (it might be messy). If quantity/pack/plan/validity are present, keep them.
+Extract a single product from this freeform text (it might be messy).
+If quantity/pack/plan/validity are present, keep them.
 Return ONLY JSON: {"name":"","plan":"","validity":"","price":"","description":""}
 
 Text:
 ${text}
-`;
+`.trim();
   try {
-  const out = await model.generateContent(prompt);
-  const raw = out.response.text();
-  const item = safeParseFirstJsonObject(raw) || {};
-  item.price = parsePrice(item.price);
-  return {
-    name: item.name || '',
-    plan: item.plan || '',
-    validity: item.validity || '',
-    price: item.price || null,
-    description: item.description || ''
-  };
-} catch {
-  return { name: '', plan: '', validity: '', price: null, description: '' };
-}
+    const out = await callGeminiWithRetry(TEXT_MODEL, prompt);
+    const raw = out.response.text();
+    const item = safeParseFirstJsonObject(raw) || {};
+    item.price = parsePrice(item.price);
+    return {
+      name: item.name || '',
+      plan: item.plan || '',
+      validity: item.validity || '',
+      price: item.price || null,
+      description: item.description || ''
+    };
+  } catch {
+    return { name: '', plan: '', validity: '', price: null, description: '' };
+  }
 }
 
-/* ---- Robust array parse to avoid "Could not detect products" ---- */
+/* robust list extractor */
 function tryParseJsonArrayAnywhere(raw) {
   if (!raw) return null;
   let s = String(raw).trim();
-  s = s.replace(/```(?:json)?\s*([\s\S]*?)\s*```/gi, '$1'); // strip code fences
+  s = s.replace(/```(?:json)?\s*([\s\S]*?)\s*```/gi, '$1');
   const start = s.indexOf('[');
   if (start === -1) return null;
   let depth = 0, end = -1;
@@ -527,7 +439,6 @@ function tryParseJsonArrayAnywhere(raw) {
 }
 
 async function extractManyFromFreeform(text) {
-  const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
   const prompt = `
 You will extract a LIST of products from messy text.
 Return ONLY JSON array in this exact shape (no prose):
@@ -538,15 +449,13 @@ Return ONLY JSON array in this exact shape (no prose):
 
 Text:
 """${text}"""
-`;
+`.trim();
   try {
-    const out = await model.generateContent(prompt);
+    const out = await callGeminiWithRetry(TEXT_MODEL, prompt);
     const raw = out.response.text();
 
-    // robust parse
     let arr = tryParseJsonArrayAnywhere(raw);
     if (!Array.isArray(arr)) {
-      // fallback: try to split by lines if not array
       const lines = String(text).split(/\n+/).map(s => s.trim()).filter(Boolean);
       arr = [];
       for (const line of lines) {
@@ -555,7 +464,6 @@ Text:
       }
     }
 
-    // normalize numbers + keep original text
     arr = (arr || []).map(x => ({
       name: x.name || '',
       plan: x.plan || '',
@@ -566,7 +474,6 @@ Text:
       _txt: text
     }));
 
-    // filter empties
     return arr.filter(x => x.name);
   } catch {
     return [];
@@ -582,53 +489,18 @@ function shortBrandName(prod) {
   return n || (prod?.name || 'Product');
 }
 
-
-/* ---------------- IMAGE GENERATION: match 80–99% + watermark ---------------- */
-
-// Build prompt for packshot (no text) or title mode, allow prompt-watermark flag
+/* ---------------- IMAGE GENERATION ---------------- */
+// exact prompt you asked for
 async function buildImagePrompt(prod) {
   const name = (prod?.name || '').toString().trim() || 'Product';
-  // bare-minimum prompt as requested
-  return `Generate ${name} image`;
+  const plan = (prod?.plan || '').toString().trim();
+  const desc = (prod?.description || '').toString().trim();
+  const title = [name, plan].filter(Boolean).join(' ');
+  // exactly: "Generate {name} {plan} Image. {description}"
+  return `Generate ${title} Image.${desc ? ' ' + desc : ''}`;
 }
 
-
-
-
-
-async function generateImageOpenAI({ prompt, size = '1024x1024' }) {
-  const out = await openai.images.generate({
-    model: process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1',
-    prompt,
-    size,
-  });
-  const b64 = out.data?.[0]?.b64_json;
-  if (!b64) throw new Error('OpenAI did not return an image');
-  return Buffer.from(b64, 'base64'); // PNG buffer
-}
-
-
-function bgOnlyPromptFrom(prompt) {
-  return `${prompt}
-
-IMPORTANT:
-- Produce ONLY a clean, aesthetic background (gradients, subtle glow, light effects).
-- Do NOT include any text, symbols, icons, watermarks, or logos.`;
-}
-
-async function generateBackgroundWithOpenAI(prompt) {
-  const res = await openai.images.generate({
-    model: process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1',
-    prompt: bgOnlyPromptFrom(prompt),
-    size: '1024x1024',
-    n: 1
-  });
-  const b64 = res.data?.[0]?.b64_json;
-  if (!b64) throw new Error('OpenAI returned no background');
-  return Buffer.from(b64, 'base64');
-}
-
-// --- tiny timeout helper (no AbortSignal needed) ---
+// small timeout helper
 function withTimeout(ms) {
   let timer = null;
   const p = new Promise((_, reject) => {
@@ -640,25 +512,8 @@ function withTimeout(ms) {
   };
 }
 
-// Accept refs and build parts accordingly
-async function generateProductImageBytes({ prompt, refImages = [], brandName }) {
-  const backend = (process.env.IMG_BACKEND || '').toLowerCase();
-  console.log('[img] backend:', backend, 'openaiModel:', process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1');
-
-  if (backend === 'openai') {
-    // pure OpenAI image gen
-    return generateImageOpenAI({ prompt });
-  }
-
-  if (backend === 'openai-bg') {
-    // OpenAI background + exact logo overlay
-    const bgBuf = await generateBackgroundWithOpenAI(prompt);
-    const logoRef = refImages?.[0];
-    if (!logoRef?.b64) throw new Error('No logo reference available');
-    return composeTileWithLogo({ bgBuf, logoRef, brandName });
-  }
-
-  // Fallback to Gemini image models (with refs)
+// Gemini-only image generation
+async function generateProductImageBytes({ prompt }) {
   const candidates = Array.from(new Set([
     DEFAULT_IMAGE_MODEL,
     'gemini-2.0-flash-preview-image-generation',
@@ -667,45 +522,40 @@ async function generateProductImageBytes({ prompt, refImages = [], brandName }) 
   ]));
 
   let lastErr;
-// Only pass the simple text prompt to Gemini
-const parts = [{ text: String(prompt || '') }];
+  for (const id of candidates) {
+    try {
+      const model = genAI.getGenerativeModel({ model: id });
+      const t = withTimeout(25000);
 
+      const res = await t.race(
+        model.generateContent({
+          contents: [{ role: 'user', parts: [{ text: String(prompt || '') }]}],
+          // force image-only return
+          generationConfig: { temperature: 0.2, responseModalities: ['IMAGE'] },
+        })
+      );
+      t.clear();
 
-for (const id of candidates) {
-  try {
-    const model = genAI.getGenerativeModel({ model: id });
-    const t = withTimeout(20000); // 20s per attempt
+      const parts = res.response?.candidates?.[0]?.content?.parts ?? [];
+      const imagePart =
+        parts.find(p => p.inlineData && p.inlineData.data) ||
+        parts.find(p => p.media && p.media.data);
+      if (!imagePart) throw new Error('No inline image returned');
 
-    const res = await t.race(
-      model.generateContent({
-        contents: [{ role: 'user', parts }],
-        generationConfig: { temperature: 0.2, responseModalities: ['TEXT', 'IMAGE'] },
-      })
-    );
-    t.clear();
-
-    const prts = res.response?.candidates?.[0]?.content?.parts ?? [];
-    const imagePart =
-      prts.find(p => p.inlineData && p.inlineData.data) ||
-      prts.find(p => p.media && p.media.data);
-    if (!imagePart) throw new Error('No inline image returned');
-
-    return Buffer.from(
-      imagePart.inlineData?.data || imagePart.media.data,
-      'base64'
-    );
-  } catch (e) {
-    lastErr = e;
-    console.warn(`Image model "${id}" failed:`, e?.message || e);
+      return Buffer.from(
+        imagePart.inlineData?.data || imagePart.media.data,
+        'base64'
+      );
+    } catch (e) {
+      lastErr = e;
+      console.warn(`Image model "${id}" failed:`, e?.message || e);
+    }
   }
-}
 
   const err = new Error('All image models failed');
   err.cause = lastErr;
   throw err;
 }
-
-
 
 async function uploadImageBufferToSupabase(
   buf,
@@ -717,9 +567,7 @@ async function uploadImageBufferToSupabase(
       : process.env.SUPABASE_BUCKET_EXCLUSIVE || 'exclusiveproduct-images';
 
   const folder = table === TABLES.products ? 'products' : 'exclusive-products';
-  const key = `${folder}/${Date.now()}-${Math.random()
-    .toString(36)
-    .slice(2)}-${filename}`;
+  const key = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2)}-${filename}`;
 
   const { error: upErr } = await supabase.storage
     .from(bucket)
@@ -730,7 +578,7 @@ async function uploadImageBufferToSupabase(
   return pub.publicUrl;
 }
 
-/* Title SVG (bigger, auto-scales) */
+/* Title SVG fallback */
 function makeTextCardSvg(title = 'Product', subtitle = '') {
   const brand = getBrandStyle?.({ name: title }) || null;
   const [c1, c2] = (brand?.palette?.length >= 2) ? brand.palette.slice(0, 2) : ['#0ea5e9', '#7c3aed'];
@@ -740,11 +588,7 @@ function makeTextCardSvg(title = 'Product', subtitle = '') {
   const t = esc(tRaw).slice(0, 48);
   const sub = esc(subtitle).slice(0, 64);
 
-  // Fit text to width: 880px area centered
-  // Start big then constrain with textLength to avoid clipping
   const sizeGuess = Math.max(72, Math.min(140, 140 - Math.max(0, tRaw.length - 10) * 4));
-  console.warn('Using SVG fallback (makeTextCardSvg)');
-
   return `
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024">
   <defs>
@@ -764,16 +608,7 @@ function makeTextCardSvg(title = 'Product', subtitle = '') {
 </svg>`.trim();
 }
 
-
-
-/** MAIN: generate image for a product with ref-match + watermark
- *  Priority inside generation:
- *   1) Photoreal/hyperreal packshot (no text), match refs 80–99%, watermark applied server-side if possible
- *   2) Title image (big readable text), brand/vibe matched, watermark
- *   3) SVG fallback (always works), watermark baked
- */
-
-// --- map common products to their real domains (extend anytime) ---
+/* --- deterministic brand tile fallback using refs (kept) --- */
 const BRAND_DOMAIN_MAP = {
   'spotify': 'spotify.com', 'spotify premium': 'spotify.com',
   'netflix': 'netflix.com',
@@ -794,22 +629,19 @@ const BRAND_DOMAIN_MAP = {
   'v0': 'v0.dev', 'v0.dev': 'v0.dev', 'vercel v0': 'v0.dev',
   'vercel': 'vercel.com',
   'tradingview': 'tradingview.com',
-'tradingview essential': 'tradingview.com',
+  'tradingview essential': 'tradingview.com',
 };
-
 
 function resolveBrandDomain(name = '') {
   const n = String(name).toLowerCase().trim();
   for (const k of Object.keys(BRAND_DOMAIN_MAP)) {
     if (n.includes(k)) return BRAND_DOMAIN_MAP[k];
   }
-  // heuristic: strip spaces/punct → .com
   const slug = n.replace(/[^a-z0-9]/g,'');
   if (slug.length >= 3) return `${slug}.com`;
   return null;
 }
 
-// pull high-confidence refs: Clearbit logo + homepage OG + unavatar (best-effort)
 async function fetchBrandRefs(name) {
   const refs = [];
   const domain = resolveBrandDomain(name);
@@ -820,12 +652,10 @@ async function fetchBrandRefs(name) {
       const og = await getOG(`https://${domain}`);
       if (og?.image) refs.push(og.image);
     } catch {}
-    // small but sometimes useful:
     refs.push(`https://icons.duckduckgo.com/ip3/${domain}.ico`);
     refs.push(`https://unavatar.io/${domain}`);
   }
 
-  // Wikipedia often returns the official wordmark/logo
   try {
     const cleaned = String(name).replace(/\b(subscription|premium|pro|account|key)\b/ig,'').trim();
     const q = encodeURIComponent(cleaned);
@@ -837,13 +667,9 @@ async function fetchBrandRefs(name) {
     }
   } catch {}
 
-  
-  // fetch as base64
   const uniq = Array.from(new Set(
-  refs.filter(Boolean)
-      .filter(u => /^https?:\/\//i.test(u))
-      .filter(u => !/\.ico(\?|$)/i.test(u))
-)).slice(0, 3);
+    refs.filter(Boolean).filter(u => /^https?:\/\//i.test(u)).filter(u => !/\.ico(\?|$)/i.test(u))
+  )).slice(0, 3);
 
   const blobs = [];
   for (const u of uniq) {
@@ -855,189 +681,71 @@ async function fetchBrandRefs(name) {
 
 async function composeTileWithLogo({ bgBuf, logoRef, brandName }) {
   if (!_sharp) throw new Error('sharp not available');
-
-  // decode logo
   const logoBuf = Buffer.from(logoRef.b64, 'base64');
 
-  // scale logo to ~55% width, auto height, centered
-  const canvas = await _sharp(bgBuf)
-    .resize(1024, 1024, { fit: 'cover' })
-    .toBuffer();
+  const canvas = await _sharp(bgBuf).resize(1024, 1024, { fit: 'cover' }).toBuffer();
+  const logoPng = await _sharp(logoBuf).resize({ width: 560, withoutEnlargement: true }).png().toBuffer();
 
-  const logoPng = await _sharp(logoBuf)
-    .resize({ width: 560, withoutEnlargement: true }) // ~55%
-    .png()
-    .toBuffer();
-
-  // brand name SVG (big, readable, within 10% padding)
   const safe = (s='').replace(/[<&>]/g,c=>({ '<':'&lt;','>':'&gt;','&':'&amp;' }[c]));
   const title = safe(brandName || 'Product').slice(0,48);
   const textSvg = Buffer.from(`
     <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="300">
-      <style>
-        .t{ font-family: "Inter","Segoe UI",Roboto,Arial; font-weight: 800; }
-      </style>
+      <style>.t{ font-family: "Inter","Segoe UI",Roboto,Arial; font-weight: 800; }</style>
       <text x="512" y="230" text-anchor="middle" class="t" font-size="96" fill="#fff">${title}</text>
     </svg>
   `);
 
-  // compose: logo centered vertically at 420px, text near bottom
   let composed = await _sharp(canvas)
-  .composite([{ input: logoPng, top: 260, left: Math.round((1024-560)/2) }])
-  .png()
-  .toBuffer();
+    .composite([{ input: logoPng, top: 260, left: Math.round((1024-560)/2) }])
+    .png().toBuffer();
 
-// then try to place text SVG (skip if Fontconfig missing)
-composed = await tryCompositeSvg(composed, textSvg, { top: 724, left: 0 });
+  composed = await tryCompositeSvg(composed, textSvg, { top: 724, left: 0 });
 
-// watermark
-const withWm = await addWatermarkToBuffer(composed, 'Harshportal') || composed;
-return withWm;
+  const withWm = await addWatermarkToBuffer(composed, 'Harshportal') || composed;
+  return withWm;
 }
 
-
-
-
-
-// --- Search the web for product name and get up to 3 image refs ---
-async function webSearchRefs(productName) {
-  if (!productName) return [];
-  try {
-    const query = encodeURIComponent(productName);
-    const searchUrl = `https://api.duckduckgo.com/?q=${query}&format=json&no_redirect=1&t=hpbot`;
-    const res = await fetch(searchUrl);
-    const data = await res.json();
-
-    let urls = [];
-    if (data?.Image) urls.push(data.Image);
-    if (Array.isArray(data?.RelatedTopics)) {
-      for (const t of data.RelatedTopics) {
-        const u = t?.Icon?.URL;
-        if (!u) continue;
-        const abs = u.startsWith('http') ? u : `https://duckduckgo.com${u}`;
-        urls.push(abs);
-      }
-    }
-
-    // keep only likely real images
-    urls = urls
-      .filter(Boolean)
-      .filter(u => /\.(jpg|jpeg|png|webp)(\?|$)/i.test(u))
-      .slice(0, 3);
-
-    const refs = [];
-    for (const u of urls) {
-      const b = await fetchAsBase64(u).catch(()=>null);
-      if (b) refs.push(b);
-    }
-    return refs;
-  } catch (err) {
-    console.warn('webSearchRefs failed:', err.message);
-    return [];
-  }
-}
-
-// --- deterministic brand tile (uses first fetched ref) ---
-// PLACE THIS JUST ABOVE ensureImageForProduct(...)
-async function composeBrandTile(prod, table) {
-  if (!_sharp) return null;
-
-  const refs = await fetchBrandRefs(prod?.name || '');
-  const ref = refs[0];
-  if (!ref) return null;
-
-  const size = 1024;
-  const recipe = brandRecipe(prod) || { bg: '#0b0b0b', fg: '#ffffff' };
-  const brand = shortBrandName(prod);
-
-  // base background
-  let out = await _sharp({
-    create: { width: size, height: size, channels: 3, background: recipe.bg }
-  }).png().toBuffer();
-
-  // center the logo (~54% width)
-  const logoBuf = Buffer.from(ref.b64, 'base64');
-  const resized = await _sharp(logoBuf)
-    .resize(Math.round(size * 0.54), null, { fit: 'inside' })
-    .png()
-    .toBuffer();
-
-  // position
-  const meta = await _sharp(resized).metadata();
-  const left = Math.round((size - (meta.width || 0)) / 2);
-  const top  = Math.round(size * 0.18);
-  out = await _sharp(out).composite([{ input: resized, left, top }]).png().toBuffer();
-
-  // brand name text (SVG overlay)
-  const textSvg = Buffer.from(`
-    <svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">
-      <text x="50%" y="${Math.round(size * 0.85)}"
-            font-family="Inter, Segoe UI, Roboto, Arial"
-            font-size="${Math.round(size * 0.09)}"
-            font-weight="800" fill="#ffffff" text-anchor="middle">${brand}</text>
-    </svg>`);
-  out = await tryCompositeSvg(out, textSvg);
-
-  // watermark (optional)
-  out = (await addWatermarkToBuffer(out, 'Harshportal')) || out;
-
-  return uploadImageBufferToSupabase(out, {
-    table,
-    filename: 'brand.png',
-    contentType: 'image/png'
-  });
-}
-
-
-
-
+/* ensure image for product */
 async function ensureImageForProduct(prod, table, style = 'neo') {
-  // Respect existing image (manual upload / URL)
   if (prod?.image && String(prod.image).trim()) return prod.image;
 
-  // Collect up to 3 strong refs
-  const brandRefs = await fetchBrandRefs(prod?.name || prod?.title || '');
-  const ogRef = prod?.og_image ? await fetchAsBase64(prod.og_image).catch(() => null) : null;
-  const refBlobs = [...brandRefs, ...(ogRef ? [ogRef] : [])].slice(0, 3);
-
-    // 1) Try photoreal / brand-true AI image first
+  // 1) Gemini image generation using ONLY your requested prompt
   try {
-   const prompt = await buildImagePrompt(prod);
-const brandName = shortBrandName(prod);
-let buf = await generateProductImageBytes({
-  prompt,            // <= add this
-  refImages: refBlobs,
-  brandName
-});
+    const prompt = await buildImagePrompt(prod);
+    const buf = await generateProductImageBytes({ prompt });
 
-
-    // Prefer server watermark (consistent & always visible)
-      if (_sharp) {
-    const wm = await addWatermarkToBuffer(buf, 'Harshportal');
-    if (wm) buf = wm;
+    let out = buf;
+    if (_sharp) {
+      const wm = await addWatermarkToBuffer(buf, 'Harshportal');
+      if (wm) out = wm;
+    }
+    return await uploadImageBufferToSupabase(out, { table, filename: 'ai.png', contentType: 'image/png' });
+  } catch (e) {
+    console.warn('AI image generation failed (Gemini). Cause:', e?.message || e);
   }
-  return await uploadImageBufferToSupabase(buf, { table, filename: 'ai.png', contentType: 'image/png' });
-} catch (e) {
-  console.warn('AI image generation failed (Gemini). Cause:', e?.message || e);
+
+  // 2) Deterministic brand tile fallback (uses first fetched ref)
+  try {
+    const refs = await fetchBrandRefs(prod?.name || '');
+    const ref = refs[0];
+    if (ref && _sharp) {
+      // simple neutral bg if brand tile path taken
+      const base = await _sharp({ create: { width:1024, height:1024, channels:3, background:'#111' } }).png().toBuffer();
+      const composed = await composeTileWithLogo({ bgBuf: base, logoRef: ref, brandName: shortBrandName(prod) });
+      return await uploadImageBufferToSupabase(composed, { table, filename: 'brand.png', contentType: 'image/png' });
+    }
+  } catch (e) {
+    console.warn('composeBrandTile failed:', e?.message || e);
+  }
+
+  // 3) SVG fallback (always works)
+  const svg = makeTextCardSvg(prod?.name || 'Digital Product', prod?.plan || prod?.subcategory || '');
+  const svgBuf = Buffer.from(svg, 'utf8');
+  return uploadImageBufferToSupabase(svgBuf, { table, filename: 'ai.svg', contentType: 'image/svg+xml' });
 }
 
-//   // 2) Deterministic brand tile fallback
-//   try {
-//     const deterministic = await composeBrandTile(prod, table);
-//     if (deterministic) return deterministic;
-//   } catch (e) {
-//     console.warn('composeBrandTile failed:', e?.message || e);
-//   }
-
-//  // 3) Last resort: SVG title card
-//    const svg = makeTextCardSvg(prod?.name || 'Digital Product', prod?.plan || prod?.subcategory || '');
-//    const svgBuf = Buffer.from(svg, 'utf8');
-//    return uploadImageBufferToSupabase(svgBuf, { table, filename: 'ai.svg', contentType: 'image/svg+xml' });
- }
-
-
 /* --------------------- /style command --------------------- */
-const STYLE_KEYS = Object.keys(STYLE_THEMES); // ['neo','minimal','gradient','cyber','clay']
+const STYLE_KEYS = Object.keys(STYLE_THEMES);
 
 bot.command('style', (ctx) => {
   if (!isAdmin(ctx)) return;
@@ -1081,7 +789,7 @@ bot.action('again_smartadd', (ctx)=>{ ctx.answerCbQuery(); ctx.session.mode=null
 bot.action('again_list',     (ctx)=>{ ctx.answerCbQuery(); ctx.reply('Use /list to view latest.'); });
 bot.action('again_update',   (ctx)=>{ ctx.answerCbQuery(); ctx.reply('Use /update <id>'); });
 bot.action('again_style',    (ctx)=>{ ctx.answerCbQuery(); ctx.reply('Use /style to pick the image theme.'); });
-bot.action('again_new',      (ctx)=>{ ctx.answerCbQuery(); ctx.reply('Use /table then type *products* or *exclusive*', { parse_mode:'Markdown' }); });
+bot.action('again_new',      (ctx)=>{ ctx.answerCbQuery(); ctx.reply('Use /table then type *products* or *exclusive*', { parse_mode: 'Markdown' }); });
 bot.action('again_done',     (ctx)=>{ ctx.answerCbQuery(); ctx.reply('All set. ✅'); });
 
 const kbEditWhich = (table) => {
@@ -1178,7 +886,6 @@ bot.command('list', async (ctx) => {
 });
 
 /* --------- ADD FLOWS --------- */
-// 1) manual wizard
 bot.command('addproduct', (ctx) => {
   if (!isAdmin(ctx)) return;
   if (!ctx.session.table) return ctx.reply('First choose a table: *products* or *exclusive*', { parse_mode: 'Markdown' });
@@ -1187,7 +894,6 @@ bot.command('addproduct', (ctx) => {
   ctx.reply('Enter *Name*:', { parse_mode: 'Markdown' });
 });
 
-// 2) AI bulk
 bot.command('addproductgemini', (ctx) => {
   if (!isAdmin(ctx)) return;
   if (!ctx.session.table) return ctx.reply('First choose a table: *products* or *exclusive*', { parse_mode: 'Markdown' });
@@ -1199,7 +905,6 @@ bot.command('addproductgemini', (ctx) => {
   ctx.reply('Paste your list. I’ll detect products automatically.');
 });
 
-// 3) SMART ADD — one messy message (optionally with URL/photo)
 bot.command('smartadd', (ctx) => {
   if (!isAdmin(ctx)) return;
   if (!ctx.session.table) return ctx.reply('First choose a table: *products* or *exclusive*', { parse_mode: 'Markdown' });
@@ -1230,22 +935,21 @@ bot.command('toggle', async (ctx) => {
 bot.on('text', async (ctx, next) => {
   if (!isAdmin(ctx)) return;
 
-  // choose table
   if (!ctx.session.table) {
     const t = ctx.message.text.trim().toLowerCase();
     if (t === 'products' || t === 'exclusive') {
       ctx.session.table = t === 'exclusive' ? TABLES.exclusive : TABLES.products;
       return ctx.reply(
-  escapeMd(
-    `Table set to ${ctx.session.table}.
+        escapeMd(
+          `Table set to ${ctx.session.table}.
 Commands:
 • /addproduct (manual)
 • /addproductgemini (AI bulk)
 • /smartadd (one-shot messy add)
 • /list  • /toggle <id>  • /update <id>`
-  ),
-  { parse_mode: 'MarkdownV2' }
-);
+        ),
+        { parse_mode: 'MarkdownV2' }
+      );
     }
     return ctx.reply('Type *products* or *exclusive*', { parse_mode: 'Markdown' });
   }
@@ -1297,7 +1001,7 @@ Commands:
       description: enriched.description || rough.description || '',
       tags: uniqMerge(enriched.tags),
       image: null,
-      og_image: ctx.session.smart.og?.image || null // ✅ pass OG image as potential reference (generation only)
+      og_image: ctx.session.smart.og?.image || null
     };
     ctx.session.mode = 'smart-photo';
     return ctx.reply('If you have a product *image*, send it now. Or type "skip".', { parse_mode: 'Markdown' });
@@ -1388,7 +1092,6 @@ Commands:
     }
   }
 
-  // inline edit handler text
   if (ctx.session.awaitEdit) {
     await applyInlineEdit(ctx);
     return;
@@ -1397,12 +1100,11 @@ Commands:
   return next();
 });
 
-/* --------------------- photo handlers (unchanged upload flow) --------------------- */
-  // -- put this helper near your other helpers --
+/* --------------------- photo handlers --------------------- */
 async function processIncomingImage(ctx, fileId, filenameHint = 'prod.jpg') {
-  const href = await tgFileUrl(fileId); // robust, works for photo & document
+  const href = await tgFileUrl(fileId);
 
-  // 1) EDIT MODE: user tapped "image" on the review keyboard
+  // 1) EDIT MODE: set new image
   if (ctx.session.awaitEdit === 'image' && ctx.session.review) {
     try {
       const { table } = ctx.session.review;
@@ -1450,8 +1152,7 @@ async function processIncomingImage(ctx, fileId, filenameHint = 'prod.jpg') {
     return;
   }
 
-
-  // 4) GEMINI BULK: waiting for an image for current item
+  // 4) GEMINI BULK: waiting for an image
   if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && ctx.session.await === 'image') {
     try {
       const imgUrl = await rehostToSupabase(href, filenameHint, ctx.session.table);
@@ -1470,7 +1171,7 @@ async function processIncomingImage(ctx, fileId, filenameHint = 'prod.jpg') {
 bot.on('photo', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const photos = ctx.message?.photo || [];
-  const fileId = photos.at(-1)?.file_id; // largest size
+  const fileId = photos.at(-1)?.file_id;
   if (!fileId) return;
   await processIncomingImage(ctx, fileId, 'prod.jpg');
 });
@@ -1478,10 +1179,9 @@ bot.on('photo', async (ctx) => {
 bot.on('document', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const doc = ctx.message?.document;
-  if (!doc || !/^image\//i.test(doc.mime_type || '')) return; // ignore non-image docs
+  if (!doc || !/^image\//i.test(doc.mime_type || '')) return;
   await processIncomingImage(ctx, doc.file_id, doc.file_name || 'prod.jpg');
 });
-
 
 /* If smart add user types "skip" instead of photo -> ask to generate */
 bot.hears(/^skip$/i, async (ctx) => {
@@ -1508,81 +1208,73 @@ bot.action('save', async (ctx) => {
   const { prod, ai, table, updateId } = ctx.session.review;
   const baseTags = uniqMerge(prod.tags, ai.tags);
 
-if (updateId) {
-  // Rehost if needed
-  if (prod.image && /^https?:\/\//i.test(prod.image) && !isSupabasePublicUrl(prod.image)) {
-    try { prod.image = await ensureHostedInSupabase(prod.image, table); } catch {}
-  }
+  if (updateId) {
+    if (prod.image && /^https?:\/\//i.test(prod.image) && !isSupabasePublicUrl(prod.image)) {
+      try { prod.image = await ensureHostedInSupabase(prod.image, table); } catch {}
+    }
 
- const idKey  = updateId; // keep as string to support UUIDs
- const imgCol = table === TABLES.products ? 'image' : 'image_url';
+    const idKey  = updateId;
+    const imgCol = table === TABLES.products ? 'image' : 'image_url';
 
- // 1) IMAGE ONLY — no .select() here
- console.log('[save] about to write', table, idKey, 'imgCol=', imgCol, 'value=', prod.image);
+    const { error: imgWriteErr } = await supabase
+      .from(table)
+      .update({ [imgCol]: prod.image || null })
+      .eq('id', idKey);
+    if (imgWriteErr) {
+      await ctx.reply(`❌ Image update failed: ${imgWriteErr.message}`);
+      return;
+    }
 
-  const { error: imgWriteErr } = await supabase
-    .from(table)
-    .update({ [imgCol]: prod.image || null })
-    .eq('id', idKey);
-  if (imgWriteErr) {
-    await ctx.reply(`❌ Image update failed: ${imgWriteErr.message}`);
+    const { data: fresh, error: readErr } = await supabase
+      .from(table)
+      .select(`id, ${imgCol}`).eq('id', idKey)
+      .maybeSingle();
+    if (readErr) {
+      console.log('[image:readback] error:', readErr);
+    } else {
+      console.log('[image:readback]', table, idKey, '->', imgCol, fresh?.[imgCol]);
+    }
+
+    const mergedTags = uniqMerge(prod.tags, ai.tags);
+    const rest = table === TABLES.products
+      ? {
+          name: prod.name,
+          plan: prod.plan || null,
+          validity: prod.validity || null,
+          price: prod.price || null,
+          originalPrice: prod.originalPrice || null,
+          description: prod.description || ai.description || null,
+          category: normalizeCategory({ ...prod, ...ai }, ai.category),
+          subcategory: ai.subcategory || null,
+          stock: prod.stock || null,
+          tags: mergedTags,
+          features: ai.features || [],
+          gradient: ai.gradient || [],
+        }
+      : {
+          name: prod.name,
+          description: prod.description || ai.description || null,
+          price: prod.price || null,
+          tags: mergedTags,
+        };
+
+    const { error: restErr } = await supabase.from(table).update(rest).eq('id', idKey);
+    if (restErr) {
+      await ctx.reply(`❌ Update failed: ${restErr.message}`);
+      return;
+    }
+
+    await ctx.reply(escapeMd(`✅ Updated ${table}`), { parse_mode: 'MarkdownV2' });
+    await ctx.reply('What next?', kbAfterTask());
+
+    ctx.session.review = null;
+    if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && Array.isArray(ctx.session.products)) {
+      ctx.session.index = (ctx.session.index || 0) + 1;
+      return handleBulkStep(ctx);
+    }
+    ctx.session.mode = null;
     return;
   }
-
-  // 2) Read-after-write (separate select)
-  const { data: fresh, error: readErr } = await supabase
-    .from(table)
-    .select(`id, ${imgCol}`).eq('id', idKey)
-    .maybeSingle();
-  if (readErr) {
-    console.log('[image:readback] error:', readErr);
-  } else {
-    console.log('[image:readback]', table, idKey, '->', imgCol, fresh?.[imgCol]);
-  }
-
-  // 3) Update the rest (avoid touching image column again)
-  const mergedTags = uniqMerge(prod.tags, ai.tags);
-  const rest = table === TABLES.products
-    ? {
-        name: prod.name,
-        plan: prod.plan || null,
-        validity: prod.validity || null,
-        price: prod.price || null,
-        originalPrice: prod.originalPrice || null,
-        description: prod.description || ai.description || null,
-        category: normalizeCategory({ ...prod, ...ai }, ai.category),
-        subcategory: ai.subcategory || null,
-        stock: prod.stock || null,
-        tags: mergedTags,
-        features: ai.features || [],
-        gradient: ai.gradient || [],
-      }
-    : {
-        name: prod.name,
-        description: prod.description || ai.description || null,
-        price: prod.price || null,
-        tags: mergedTags,
-      };
-
-  const { error: restErr } = await supabase.from(table).update(rest).eq('id', idKey);
-  if (restErr) {
-    await ctx.reply(`❌ Update failed: ${restErr.message}`);
-    return;
-  }
-
-  await ctx.reply(escapeMd(`✅ Updated ${table}`), { parse_mode: 'MarkdownV2' });
-  await ctx.reply('What next?', kbAfterTask());
-
-  ctx.session.review = null;
-  if (ctx.session.mode === 'gemini' && ctx.session.stage === 'step' && Array.isArray(ctx.session.products)) {
-  ctx.session.index = (ctx.session.index || 0) + 1; // move pointer now
-  return handleBulkStep(ctx);
-}
-  ctx.session.mode = null;
-  return;
-}
-
-
 
   // INSERT new (dupe guard)
   const { data: dup } = await supabase
@@ -1688,10 +1380,8 @@ bot.action('gen_img_yes', async (ctx) => {
     const table = ctx.session.table;
     const prodBase = { ...ctx.session.smart.prod };
 
-    // enrich first for a richer prompt
     const ai = await enrichWithAI(prodBase, ctx.session.smart.text, ctx.session.smart.og);
 
-    // include OG image as ref for generation only
     const prodForPrompt = { ...prodBase, ...ai, category: normalizeCategory({ ...prodBase, ...ai }, ai.category) };
 
     const url = await ensureImageForProduct(prodForPrompt, table, ctx.session.style || 'neo');
@@ -1815,7 +1505,6 @@ async function handleBulkStep(ctx) {
   const items = ctx.session.products || [];
   const idx = ctx.session.index || 0;
 
-  // finished?
   if (idx >= items.length) {
     ctx.session.mode = null;
     ctx.session.stage = null;
@@ -1847,13 +1536,10 @@ async function handleBulkStep(ctx) {
   }
 
   ctx.session.review = { prod, ai: prod._ai, table };
-await ctx.replyWithMarkdownV2(reviewMessage(prod, prod._ai, table), kbConfirm);
+  await ctx.replyWithMarkdownV2(reviewMessage(prod, prod._ai, table), kbConfirm);
 
-// ➜ advance to the next item now, so after "Save" we move on
-ctx.session.index = idx + 1;
-
-ctx.session.await = null;
-
+  ctx.session.index = idx + 1;
+  ctx.session.await = null;
 }
 
 /* --------------------- errors & launch --------------------- */
@@ -1865,4 +1551,3 @@ bot.catch((err, ctx) => {
 bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
 bot.launch();
 console.log('🚀 Product Bot running with /smartadd and /update');
-
