@@ -40,6 +40,15 @@ const DEFAULT_IMAGE_MODEL =
 // Escape MarkdownV2 for Telegram safely
 const escapeMd = (v = '') => toStr(v).replace(/([_\*\[\]\(\)~`>#+\-=|{}\.!])/g, '\\$1');
 
+function safeParseFirstJsonObject(s) {
+  if (!s) return null;
+  s = String(s).replace(/```(?:json)?\s*([\s\S]*?)\s*```/gi, '$1').trim();
+  const m = s.match(/\{[\s\S]*\}/m);
+  if (!m) return null;
+  try { return JSON.parse(m[0]); } catch { return null; }
+}
+
+
 const parsePrice = (raw) => {
   if (!raw) return null;
   const m = String(raw).match(/(\d[\d,\.]*)/);
@@ -118,6 +127,7 @@ function guessMime(buf, filenameHint='') {
 
   return { mime: 'image/jpeg', ext: 'jpg' };
 }
+
 
 
 
@@ -341,6 +351,23 @@ async function fetchAsBase64(url) {
   }
 }
 
+
+let canSvgText = true;
+
+async function tryCompositeSvg(baseBuf, svgBuf, opts={}) {
+  try {
+    return await _sharp(baseBuf).composite([{ input: svgBuf, ...opts }]).png().toBuffer();
+  } catch (e) {
+    if (/Fontconfig/i.test(String(e))) {
+      canSvgText = false;
+      console.warn('SVG text disabled: fontconfig missing');
+      return baseBuf;
+    }
+    throw e;
+  }
+}
+
+
 // optional watermark with sharp; fall back to prompt watermark
 let _sharp = null;
 try { _sharp = require('sharp'); } catch {}
@@ -397,46 +424,46 @@ Return ONLY JSON:
 `;
 
   try {
-    const out = await model.generateContent(prompt);
-    const text = await out.response.text();
-    const json = JSON.parse(text.match(/\{[\s\S]*\}$/m)[0]);
+  const out = await model.generateContent(prompt);
+  const text = out.response.text().trim();
+  const json = safeParseFirstJsonObject(text) || {};
 
-    // Clean + coerce
-    json.name = (json.name || prod.name || '').toString().trim();
-    json.description = (json.description || prod.description || '').toString().trim();
-    if (json.price !== 'unknown') json.price = parsePrice(json.price);
+  // Clean + coerce
+  json.name = (json.name || prod.name || '').toString().trim();
+  json.description = (json.description || prod.description || '').toString().trim();
+  if (json.price !== 'unknown') json.price = parsePrice(json.price);
 
-    // clamp to allowed categories
-    json.category = normalizeCategory({ ...prod, ...json }, json.category);
+  // clamp to allowed categories
+  json.category = normalizeCategory({ ...prod, ...json }, json.category);
 
-    json.tags = Array.isArray(json.tags) ? json.tags.slice(0, 8) : [];
+  json.tags = Array.isArray(json.tags) ? json.tags.slice(0, 8) : [];
 
-    // Features (normalize to 3–6 short items)
-    let feats = Array.isArray(json.features) ? json.features : [];
-    if (!feats.length && textHints) {
-      feats = String(textHints)
-        .split(/\n|[;•·\-–—]\s+/g)
-        .map(s => s.trim())
-        .filter(s => s.length > 3 && s.length <= 80)
-        .slice(0, 6);
-    }
-    json.features = feats
-      .map(s => s.replace(/^[\-\*\•\·–—]\s*/, '').trim())
-      .filter(Boolean)
+  // Features (normalize to 3–6 short items)
+  let feats = Array.isArray(json.features) ? json.features : [];
+  if (!feats.length && textHints) {
+    feats = String(textHints)
+      .split(/\n|[;•·\-–—]\s+/g)
+      .map(s => s.trim())
+      .filter(s => s.length > 3 && s.length <= 80)
       .slice(0, 6);
+  }
+  json.features = feats
+    .map(s => s.replace(/^[\-\*\•\•–—]\s*/, '').trim())
+    .filter(Boolean)
+    .slice(0, 6);
 
-    // Gradient (2 colors) fallback to brand palette if missing
-    const palette = (brand?.palette && brand.palette.length >= 2)
-      ? brand.palette.slice(0, 2)
-      : ['#0ea5e9', '#7c3aed']; // cyan → violet fallback
-    if (!Array.isArray(json.gradient) || json.gradient.length < 2) {
-      json.gradient = palette;
-    } else {
-      json.gradient = json.gradient.slice(0, 2);
-    }
+  // Gradient fallback
+  const palette = (brand?.palette && brand.palette.length >= 2)
+    ? brand.palette.slice(0, 2)
+    : ['#0ea5e9', '#7c3aed'];
+  if (!Array.isArray(json.gradient) || json.gradient.length < 2) {
+    json.gradient = palette;
+  } else {
+    json.gradient = json.gradient.slice(0, 2);
+  }
 
-    return json;
-  } catch (e) {
+  return json;
+} catch (e) {
     console.error('AI enrich error:', e.message);
     // Safe fallback
     const palette = (getBrandStyle?.(prod)?.palette?.slice(0,2)) || ['#0ea5e9','#7c3aed'];
@@ -466,14 +493,20 @@ Text:
 ${text}
 `;
   try {
-    const out = await model.generateContent(prompt);
-    const raw = out.response.text();
-    const item = JSON.parse(raw.match(/\{[\s\S]*\}$/m)[0]);
-    item.price = parsePrice(item.price);
-    return item;
-  } catch {
-    return { name: '', plan: '', validity: '', price: null, description: '' };
-  }
+  const out = await model.generateContent(prompt);
+  const raw = out.response.text();
+  const item = safeParseFirstJsonObject(raw) || {};
+  item.price = parsePrice(item.price);
+  return {
+    name: item.name || '',
+    plan: item.plan || '',
+    validity: item.validity || '',
+    price: item.price || null,
+    description: item.description || ''
+  };
+} catch {
+  return { name: '', plan: '', validity: '', price: null, description: '' };
+}
 }
 
 /* ---- Robust array parse to avoid "Could not detect products" ---- */
@@ -573,8 +606,9 @@ No borders. No extra iconography. Do NOT invent a new logo.`.trim();
 
   const recipe = brandRecipe(prod);
   const motif = recipe
-    ? `Visual recipe: ${recipe.describe}. Background ${recipe.bg}, logo color ${recipe.fg}.`
-    : brandHints;
+  ? `Exact official ${brandName} logo silhouette and colors from reference. Apply recipe: ${recipe.describe}, background ${recipe.bg}, logo color ${recipe.fg}.`
+  : `Exact official ${brandName} logo silhouette and colors from reference; avoid generic gradients.`;
+
 
   const user = `
 Product:
@@ -590,7 +624,7 @@ Rules:
 - Avoid generic gradient circles; vary the look per brand.
 ${wantPromptWatermark ? 'Add a tiny bottom-right watermark text: "Harshportal".' : ''}
 
-Negative: placeholder blobs, tiny/cropped text, extra logos, heavy glare, borders, watermarks (unless requested).`.trim();
+Negative: placeholder blobs, tiny/cropped text, extra logos, heavy glare, borders, watermarks, generic blue/purple gradient backgrounds, placeholder blobs, tiny text, stock icons, fake logos (unless requested).`.trim();
 
   try {
     const out = await model.generateContent({
@@ -803,6 +837,8 @@ const BRAND_DOMAIN_MAP = {
   'windows': 'microsoft.com', 'windows 10': 'microsoft.com', 'windows 11': 'microsoft.com',
   'v0': 'v0.dev', 'v0.dev': 'v0.dev', 'vercel v0': 'v0.dev',
   'vercel': 'vercel.com',
+  'tradingview': 'tradingview.com',
+'tradingview essential': 'tradingview.com',
 };
 
 
@@ -845,8 +881,14 @@ async function fetchBrandRefs(name) {
     }
   } catch {}
 
+  
   // fetch as base64
-  const uniq = Array.from(new Set(refs.filter(Boolean))).slice(0, 3);
+  const uniq = Array.from(new Set(
+  refs.filter(Boolean)
+      .filter(u => /^https?:\/\//i.test(u))
+      .filter(u => !/\.ico(\?|$)/i.test(u))
+)).slice(0, 3);
+
   const blobs = [];
   for (const u of uniq) {
     const b = await fetchAsBase64(u).catch(() => null);
@@ -884,17 +926,17 @@ async function composeTileWithLogo({ bgBuf, logoRef, brandName }) {
   `);
 
   // compose: logo centered vertically at 420px, text near bottom
-  const composed = await _sharp(canvas)
-    .composite([
-      { input: logoPng, top: 260, left: Math.round((1024-560)/2) },
-      { input: textSvg, top: 724, left: 0 }
-    ])
-    .png()
-    .toBuffer();
+  let composed = await _sharp(canvas)
+  .composite([{ input: logoPng, top: 260, left: Math.round((1024-560)/2) }])
+  .png()
+  .toBuffer();
 
-  // watermark (your existing helper)
-  const withWm = await addWatermarkToBuffer(composed, 'Harshportal') || composed;
-  return withWm;
+// then try to place text SVG (skip if Fontconfig missing)
+composed = await tryCompositeSvg(composed, textSvg, { top: 724, left: 0 });
+
+// watermark
+const withWm = await addWatermarkToBuffer(composed, 'Harshportal') || composed;
+return withWm;
 }
 
 
@@ -964,10 +1006,10 @@ async function composeBrandTile(prod, table) {
     .png()
     .toBuffer();
 
+  // position
   const meta = await _sharp(resized).metadata();
   const left = Math.round((size - (meta.width || 0)) / 2);
   const top  = Math.round(size * 0.18);
-
   out = await _sharp(out).composite([{ input: resized, left, top }]).png().toBuffer();
 
   // brand name text (SVG overlay)
@@ -978,13 +1020,18 @@ async function composeBrandTile(prod, table) {
             font-size="${Math.round(size * 0.09)}"
             font-weight="800" fill="#ffffff" text-anchor="middle">${brand}</text>
     </svg>`);
-  out = await _sharp(out).composite([{ input: textSvg }]).png().toBuffer();
+  out = await tryCompositeSvg(out, textSvg);
 
   // watermark (optional)
   out = (await addWatermarkToBuffer(out, 'Harshportal')) || out;
 
-  return uploadImageBufferToSupabase(out, { table, filename: 'brand.png', contentType: 'image/png' });
+  return uploadImageBufferToSupabase(out, {
+    table,
+    filename: 'brand.png',
+    contentType: 'image/png'
+  });
 }
+
 
 
 
