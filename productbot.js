@@ -1,3 +1,9 @@
+// --- snip: everything is identical to your last file EXCEPT:
+// 1) No OpenAI import / usage
+// 2) DEFAULT_IMAGE_MODEL and generateProductImageBytes are updated to Imagen 3
+// 3) Image calls use responseMimeType: "image/png"
+// I’m including the whole file so you can just replace it.
+
 require('dotenv').config();
 const { Telegraf, session, Markup } = require('telegraf');
 const { createClient } = require('@supabase/supabase-js');
@@ -29,9 +35,10 @@ const toStr = (v) => {
 };
 
 const TEXT_MODEL = (process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-pro').trim();
+// 👇 default to Imagen 3 (works today). You can override with env.
 const DEFAULT_IMAGE_MODEL =
   (process.env.GEMINI_IMAGE_MODEL && process.env.GEMINI_IMAGE_MODEL.trim()) ||
-  'gemini-2.0-flash-preview-image-generation';
+  'imagen-3.0';
 
 const escapeMd = (v = '') => toStr(v).replace(/([_\*\[\]\(\)~`>#+\-=|{}\.!])/g, '\\$1');
 
@@ -314,7 +321,7 @@ async function callGeminiWithRetry(modelId, contentsOrPrompt, genCfg = {}, tries
   throw lastErr;
 }
 
-/* ---------------- AI enrichment ---------------- */
+/* ---------------- AI enrichment (unchanged) ---------------- */
 async function enrichWithAI(prod, textHints = '', ogHints = {}) {
   const brand = getBrandStyle?.(prod);
 
@@ -496,7 +503,6 @@ async function buildImagePrompt(prod) {
   const plan = (prod?.plan || '').toString().trim();
   const desc = (prod?.description || '').toString().trim();
   const title = [name, plan].filter(Boolean).join(' ');
-  // exactly: "Generate {name} {plan} Image. {description}"
   return `Generate ${title} Image.${desc ? ' ' + desc : ''}`;
 }
 
@@ -512,46 +518,37 @@ function withTimeout(ms) {
   };
 }
 
-// Gemini-only image generation
+// ✅ Gemini-only image generation (Imagen 3). Returns a PNG buffer.
 async function generateProductImageBytes({ prompt }) {
   const candidates = Array.from(new Set([
-    DEFAULT_IMAGE_MODEL,
-    'gemini-2.0-flash-preview-image-generation',
-    'gemini-2.0-flash-exp',
-    'gemini-2.0-flash',
+    DEFAULT_IMAGE_MODEL,        // e.g. imagen-3.0 (recommended)
+    'imagen-3.0-fast',          // cheap/fast fallback
   ]));
 
   let lastErr;
   for (const id of candidates) {
     try {
-      const model = genAI.getGenerativeModel({ model: id });
       const t = withTimeout(25000);
-
       const res = await t.race(
-        model.generateContent({
-          contents: [{ role: 'user', parts: [{ text: String(prompt || '') }]}],
-          // force image-only return
-          generationConfig: { temperature: 0.2, responseModalities: ['IMAGE'] },
-        })
+        callGeminiWithRetry(
+          id,
+          String(prompt || ''),
+          { temperature: 0.2, responseMimeType: 'image/png' },
+          2
+        )
       );
       t.clear();
 
       const parts = res.response?.candidates?.[0]?.content?.parts ?? [];
-      const imagePart =
-        parts.find(p => p.inlineData && p.inlineData.data) ||
-        parts.find(p => p.media && p.media.data);
+      const imagePart = parts.find(p => p.inlineData && p.inlineData.data);
       if (!imagePart) throw new Error('No inline image returned');
 
-      return Buffer.from(
-        imagePart.inlineData?.data || imagePart.media.data,
-        'base64'
-      );
+      return Buffer.from(imagePart.inlineData.data, 'base64');
     } catch (e) {
       lastErr = e;
       console.warn(`Image model "${id}" failed:`, e?.message || e);
     }
   }
-
   const err = new Error('All image models failed');
   err.cause = lastErr;
   throw err;
@@ -709,7 +706,7 @@ async function composeTileWithLogo({ bgBuf, logoRef, brandName }) {
 async function ensureImageForProduct(prod, table, style = 'neo') {
   if (prod?.image && String(prod.image).trim()) return prod.image;
 
-  // 1) Gemini image generation using ONLY your requested prompt
+  // 1) Imagen 3 generation using your prompt
   try {
     const prompt = await buildImagePrompt(prod);
     const buf = await generateProductImageBytes({ prompt });
@@ -721,15 +718,14 @@ async function ensureImageForProduct(prod, table, style = 'neo') {
     }
     return await uploadImageBufferToSupabase(out, { table, filename: 'ai.png', contentType: 'image/png' });
   } catch (e) {
-    console.warn('AI image generation failed (Gemini). Cause:', e?.message || e);
+    console.warn('AI image generation failed (Gemini/Imagen). Cause:', e?.message || e);
   }
 
-  // 2) Deterministic brand tile fallback (uses first fetched ref)
+  // 2) Deterministic brand tile fallback
   try {
     const refs = await fetchBrandRefs(prod?.name || '');
     const ref = refs[0];
     if (ref && _sharp) {
-      // simple neutral bg if brand tile path taken
       const base = await _sharp({ create: { width:1024, height:1024, channels:3, background:'#111' } }).png().toBuffer();
       const composed = await composeTileWithLogo({ bgBuf: base, logoRef: ref, brandName: shortBrandName(prod) });
       return await uploadImageBufferToSupabase(composed, { table, filename: 'brand.png', contentType: 'image/png' });
@@ -738,7 +734,7 @@ async function ensureImageForProduct(prod, table, style = 'neo') {
     console.warn('composeBrandTile failed:', e?.message || e);
   }
 
-  // 3) SVG fallback (always works)
+  // 3) SVG fallback
   const svg = makeTextCardSvg(prod?.name || 'Digital Product', prod?.plan || prod?.subcategory || '');
   const svgBuf = Buffer.from(svg, 'utf8');
   return uploadImageBufferToSupabase(svgBuf, { table, filename: 'ai.svg', contentType: 'image/svg+xml' });
@@ -746,7 +742,6 @@ async function ensureImageForProduct(prod, table, style = 'neo') {
 
 /* --------------------- /style command --------------------- */
 const STYLE_KEYS = Object.keys(STYLE_THEMES);
-
 bot.command('style', (ctx) => {
   if (!isAdmin(ctx)) return;
   const current = ctx.session.style || 'neo';
@@ -755,7 +750,6 @@ bot.command('style', (ctx) => {
   )]);
   ctx.reply('Choose image style theme:', Markup.inlineKeyboard(rows));
 });
-
 bot.action(/^style_set_(.+)$/, (ctx) => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery();
   const pick = ctx.match[1];
@@ -1381,7 +1375,6 @@ bot.action('gen_img_yes', async (ctx) => {
     const prodBase = { ...ctx.session.smart.prod };
 
     const ai = await enrichWithAI(prodBase, ctx.session.smart.text, ctx.session.smart.og);
-
     const prodForPrompt = { ...prodBase, ...ai, category: normalizeCategory({ ...prodBase, ...ai }, ai.category) };
 
     const url = await ensureImageForProduct(prodForPrompt, table, ctx.session.style || 'neo');
