@@ -1470,79 +1470,62 @@ bot.action('save', async (ctx) => {
   const { prod, ai, table, updateId } = ctx.session.review;
   const baseTags = uniqMerge(prod.tags, ai.tags);
 
-   if (updateId) {
-  // rehost external url if needed
+if (updateId) {
+  // Rehost external URL only if it isn't already in your storage
   if (prod.image && /^https?:\/\//i.test(prod.image) && !isSupabasePublicUrl(prod.image)) {
     try { prod.image = await ensureHostedInSupabase(prod.image, table); } catch {}
   }
 
-  // Find which column to use
-const selectCols = table === TABLES.products ? 'id,image' : 'id,image_url';
-  const { data: row, error: preErr } = await supabase
-    .from(table)
-    .select(selectCols)
-    .eq('id', Number(updateId))
-    .maybeSingle();
-
-  if (preErr || !row) {
-    await ctx.reply(`❌ Can't load row ${updateId}: ${preErr?.message || 'not found'}`);
-    return;
-  }
+  // products -> image, exclusive_products -> image_url
   const imgCol = table === TABLES.products ? 'image' : 'image_url';
-  if (!imgCol) {
-    await ctx.reply('⚠️ No image column (`image` or `image_url`) found on this table.');
-    return;
-  }
 
-  const mergedTags = uniqMerge(prod.tags, ai.tags);
-
-  const payload = (table === TABLES.products)
-    ? {
-        name: prod.name,
-        plan: prod.plan || null,
-        validity: prod.validity || null,
-        price: prod.price || null,
-        originalPrice: prod.originalPrice || null,
-        description: prod.description || ai.description || null,
-        category: normalizeCategory({ ...prod, ...ai }, ai.category),
-        subcategory: ai.subcategory || null,
-        stock: prod.stock || null,
-        tags: mergedTags,
-        features: ai.features || [],
-        gradient: ai.gradient || [],
-        [imgCol]: prod.image || null,
-      }
-    : {
-        name: prod.name,
-        description: prod.description || ai.description || null,
-        price: prod.price || null,
-        tags: mergedTags,
-        [imgCol]: prod.image || null,
-      };
-
-  console.log('[save] about to write', table, updateId, 'imgCol=', imgCol, 'value=', payload[imgCol]);
-
-  // 1) Write
-  const { error: upErr } = await supabase
+  // 1) IMAGE-ONLY UPDATE + verify immediately
+  console.log('[save] about to write', table, updateId, 'imgCol=', imgCol, 'value=', prod.image);
+  const { data: imgRows, error: imgErr } = await supabase
     .from(table)
-    .update(payload)
-    .eq('id', Number(updateId));
-  if (upErr) {
-    await ctx.reply(`❌ Update failed: ${upErr.message}`);
+    .update({ [imgCol]: prod.image || null })
+    .eq('id', Number(updateId))
+    .select(`id, ${imgCol}`);
+
+  if (imgErr) {
+    await ctx.reply(`❌ Image update failed: ${imgErr.message}`);
     return;
   }
+  console.log('[image-only:update]', table, updateId, '->', imgRows?.[0]?.[imgCol]);
 
-  // 2) Read-after-write to verify what’s actually saved
-  const { data: fresh, error: readErr } = await supabase
-   .from(table)
-   .select(`id, ${imgCol}`)
-   .eq('id', Number(updateId))
-   .maybeSingle();
+  // 2) Update the rest of the fields (do NOT include the image column here)
+  const mergedTags = uniqMerge(prod.tags, ai.tags);
+  const rest =
+    table === TABLES.products
+      ? {
+          name: prod.name,
+          plan: prod.plan || null,
+          validity: prod.validity || null,
+          price: prod.price || null,
+          originalPrice: prod.originalPrice || null,
+          description: prod.description || ai.description || null,
+          category: normalizeCategory({ ...prod, ...ai }, ai.category),
+          subcategory: ai.subcategory || null,
+          stock: prod.stock || null,
+          tags: mergedTags,
+          features: ai.features || [],
+          gradient: ai.gradient || [],
+        }
+      : {
+          name: prod.name,
+          description: prod.description || ai.description || null,
+          price: prod.price || null,
+          tags: mergedTags,
+        };
 
-  if (readErr) {
-    console.log('[image:update] read-after-write error:', readErr);
-  } else {
-    console.log('[image:update]', table, updateId, '->', imgCol, fresh?.[imgCol]);
+  const { error: restErr } = await supabase
+    .from(table)
+    .update(rest)
+    .eq('id', Number(updateId));
+
+  if (restErr) {
+    await ctx.reply(`❌ Update failed: ${restErr.message}`);
+    return;
   }
 
   await ctx.reply(escapeMd(`✅ Updated ${table}`), { parse_mode: 'MarkdownV2' });
