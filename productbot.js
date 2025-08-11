@@ -1471,58 +1471,62 @@ bot.action('save', async (ctx) => {
   const baseTags = uniqMerge(prod.tags, ai.tags);
 
 if (updateId) {
-  // Rehost external URL only if it isn't already in your storage
+  // Rehost if needed
   if (prod.image && /^https?:\/\//i.test(prod.image) && !isSupabasePublicUrl(prod.image)) {
     try { prod.image = await ensureHostedInSupabase(prod.image, table); } catch {}
   }
 
-  // products -> image, exclusive_products -> image_url
+  const idNum  = Number(updateId);
   const imgCol = table === TABLES.products ? 'image' : 'image_url';
 
-  // 1) IMAGE-ONLY UPDATE + verify immediately
-  console.log('[save] about to write', table, updateId, 'imgCol=', imgCol, 'value=', prod.image);
-  const { data: imgRows, error: imgErr } = await supabase
+  // 1) IMAGE ONLY — no .select() here
+  console.log('[save] about to write', table, idNum, 'imgCol=', imgCol, 'value=', prod.image);
+  const { error: imgWriteErr } = await supabase
     .from(table)
     .update({ [imgCol]: prod.image || null })
-    .eq('id', Number(updateId))
-    .select(`id, ${imgCol}`);
-
-  if (imgErr) {
-    await ctx.reply(`❌ Image update failed: ${imgErr.message}`);
+    .eq('id', idNum);
+  if (imgWriteErr) {
+    await ctx.reply(`❌ Image update failed: ${imgWriteErr.message}`);
     return;
   }
-  console.log('[image-only:update]', table, updateId, '->', imgRows?.[0]?.[imgCol]);
 
-  // 2) Update the rest of the fields (do NOT include the image column here)
-  const mergedTags = uniqMerge(prod.tags, ai.tags);
-  const rest =
-    table === TABLES.products
-      ? {
-          name: prod.name,
-          plan: prod.plan || null,
-          validity: prod.validity || null,
-          price: prod.price || null,
-          originalPrice: prod.originalPrice || null,
-          description: prod.description || ai.description || null,
-          category: normalizeCategory({ ...prod, ...ai }, ai.category),
-          subcategory: ai.subcategory || null,
-          stock: prod.stock || null,
-          tags: mergedTags,
-          features: ai.features || [],
-          gradient: ai.gradient || [],
-        }
-      : {
-          name: prod.name,
-          description: prod.description || ai.description || null,
-          price: prod.price || null,
-          tags: mergedTags,
-        };
-
-  const { error: restErr } = await supabase
+  // 2) Read-after-write (separate select)
+  const { data: fresh, error: readErr } = await supabase
     .from(table)
-    .update(rest)
-    .eq('id', Number(updateId));
+    .select(`id, ${imgCol}`)
+    .eq('id', idNum)
+    .maybeSingle();
+  if (readErr) {
+    console.log('[image:readback] error:', readErr);
+  } else {
+    console.log('[image:readback]', table, idNum, '->', imgCol, fresh?.[imgCol]);
+  }
 
+  // 3) Update the rest (avoid touching image column again)
+  const mergedTags = uniqMerge(prod.tags, ai.tags);
+  const rest = table === TABLES.products
+    ? {
+        name: prod.name,
+        plan: prod.plan || null,
+        validity: prod.validity || null,
+        price: prod.price || null,
+        originalPrice: prod.originalPrice || null,
+        description: prod.description || ai.description || null,
+        category: normalizeCategory({ ...prod, ...ai }, ai.category),
+        subcategory: ai.subcategory || null,
+        stock: prod.stock || null,
+        tags: mergedTags,
+        features: ai.features || [],
+        gradient: ai.gradient || [],
+      }
+    : {
+        name: prod.name,
+        description: prod.description || ai.description || null,
+        price: prod.price || null,
+        tags: mergedTags,
+      };
+
+  const { error: restErr } = await supabase.from(table).update(rest).eq('id', idNum);
   if (restErr) {
     await ctx.reply(`❌ Update failed: ${restErr.message}`);
     return;
