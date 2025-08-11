@@ -586,55 +586,12 @@ function shortBrandName(prod) {
 /* ---------------- IMAGE GENERATION: match 80–99% + watermark ---------------- */
 
 // Build prompt for packshot (no text) or title mode, allow prompt-watermark flag
-// 80–99% match prompt builder (supports optional prompt-watermark)
-async function buildImagePrompt(prod, styleName = 'neo', wantPromptWatermark = false) {
-  const model = genAI.getGenerativeModel({ model: TEXT_MODEL });
-  const themeText = STYLE_THEMES[styleName] || STYLE_THEMES.neo;
-  const brand = getBrandStyle(prod);
-  const brandName = shortBrandName(prod);
-  const palette = brand?.palette?.join(', ') || 'brand-accurate colors';
-  const brandHints = brand?.keywords || 'official logomark proportions';
-
-  const sys = `
-Create a 1024x1024 ecommerce product tile. You may receive up to 3 reference images.
-MUST reproduce the official brand/logo silhouette and colors **80–99%** as in the references.
-Layout:
-- large logo centered
-- short brand/product name beneath the logo in bold, clean sans-serif
-- keep at least 10% padding from every edge
-No borders. No extra iconography. Do NOT invent a new logo.`.trim();
-
-  const recipe = brandRecipe(prod);
-  const motif = recipe
-  ? `Exact official ${brandName} logo silhouette and colors from reference. Apply recipe: ${recipe.describe}, background ${recipe.bg}, logo color ${recipe.fg}.`
-  : `Exact official ${brandName} logo silhouette and colors from reference; avoid generic gradients.`;
-
-
-  const user = `
-Product:
-${JSON.stringify({ name: prod?.name, category: prod?.category, tags: prod?.tags })}
-
-Brand/context: ${brandName}
-Palette: ${palette}
-Motifs: ${motif}
-
-Rules:
-- Treat reference images as ground truth for shape and color.
-- Keep name text short and **fully readable** within the tile bounds.
-- Avoid generic gradient circles; vary the look per brand.
-${wantPromptWatermark ? 'Add a tiny bottom-right watermark text: "Harshportal".' : ''}
-
-Negative: placeholder blobs, tiny/cropped text, extra logos, heavy glare, borders, watermarks, generic blue/purple gradient backgrounds, placeholder blobs, tiny text, stock icons, fake logos (unless requested).`.trim();
-
-  try {
-    const out = await model.generateContent({
-  contents: [{ role: 'user', parts: [{ text: sys + '\n\n' + user }]}]
-});
-    return out.response.text().trim().replace(/\s+/g, ' ');
-  } catch {
-    return `Brand-accurate 1:1 tile for ${brandName}; large centered official logo; readable brand name under it; ${themeText}; match references 80–99%; no borders.`;
-  }
+async function buildImagePrompt(prod) {
+  const name = (prod?.name || '').toString().trim() || 'Product';
+  // bare-minimum prompt as requested
+  return `Generate ${name} image`;
 }
+
 
 
 
@@ -710,12 +667,9 @@ async function generateProductImageBytes({ prompt, refImages = [], brandName }) 
   ]));
 
   let lastErr;
-  const parts = [];
-  for (const r of (refImages || []).slice(0, 3)) {
-    if (r?.b64) parts.push({ inlineData: { data: r.b64, mimeType: r.mime || 'image/jpeg' } });
-  }
-  const safePrompt = String(prompt || '');
-  parts.push({ text: safePrompt });
+// Only pass the simple text prompt to Gemini
+const parts = [{ text: String(prompt || '') }];
+
 
 for (const id of candidates) {
   try {
@@ -1046,7 +1000,7 @@ async function ensureImageForProduct(prod, table, style = 'neo') {
 
     // 1) Try photoreal / brand-true AI image first
   try {
-   const prompt = await buildImagePrompt(prod, style, !_sharp);
+   const prompt = await buildImagePrompt(prod);
 const brandName = shortBrandName(prod);
 let buf = await generateProductImageBytes({
   prompt,            // <= add this
