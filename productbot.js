@@ -20,6 +20,8 @@ for (const k of REQUIRED_ENV) if (!process.env[k]) console.error(`❌ Missing en
 
 const HF_KEY = process.env.HUGGING_FACE_API_KEY || '';
 const DEEPAI_KEY = process.env.DEEPAI_API_KEY || '';
+const IMAGE_TEXT_OVERLAY = (process.env.IMAGE_TEXT_OVERLAY || '1') === '1';
+
 // near the other env reads
 // Gemini config — SINGLE SOURCE OF TRUTH
 const GEMINI_KEYS = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '')
@@ -901,27 +903,30 @@ async function createInitialImage(prod) {
   </svg>`;
 
   // Title/plan overlay SVG
-  // (kept similar to your composeTextOverBackground for visual consistency)
-  const esc = (s='') => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-  function wrap(text, maxWidth, maxLines) {
-    const words = String(text).trim().split(/\s+/);
-    const lines = [];
-    let cur = '';
-    for (const w of words) {
-      if ((cur + ' ' + w).trim().length <= maxWidth) cur = (cur ? cur + ' ' : '') + w;
-      else { lines.push(cur); cur = w; if (lines.length >= maxLines-1) break; }
-    }
-    if (cur) lines.push(cur);
-    return lines.slice(0, maxLines);
+const esc = (s='') => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+function wrap(text, maxWidth, maxLines) {
+  const words = String(text).trim().split(/\s+/);
+  const lines = []; let cur = '';
+  for (const w of words) {
+    if ((cur + ' ' + w).trim().length <= maxWidth) cur = (cur ? cur + ' ' : '') + w;
+    else { lines.push(cur); cur = w; if (lines.length >= maxLines-1) break; }
   }
-  const titleLines = wrap(title, 18, 2);
-  const titleSize = titleLines.length > 1 ? 100 : 120;
-  const tspans = titleLines.map((line,i)=>`<tspan x="512" dy="${i===0?0:'1.2em'}">${esc(line)}</tspan>`).join('');
-  const overlaySvg = `
-  <svg width="1024" height="512" viewBox="0 0 1024 512" xmlns="http://www.w3.org/2000/svg">
-    <text y="256" text-anchor="middle" font-family="Inter, Segoe UI, sans-serif" font-size="${titleSize}" font-weight="bold" fill="#FFFFFF">${tspans}</text>
-    ${plan ? `<text x="512" y="400" text-anchor="middle" font-family="Inter, Segoe UI, sans-serif" font-size="60" font-weight="500" fill="#E5E7EB">${esc(plan)}</text>` : ''}
-  </svg>`;
+  if (cur) lines.push(cur);
+  return lines.slice(0, maxLines);
+}
+const titleLines = wrap(title, 18, 2);
+const titleSize = titleLines.length > 1 ? 100 : 120;
+const tspans = titleLines.map((line,i)=>`<tspan x="512" dy="${i===0?0:'1.2em'}">${esc(line)}</tspan>`).join('');
+const overlaySvg = `
+<svg width="1024" height="512" viewBox="0 0 1024 512" xmlns="http://www.w3.org/2000/svg">
+  <text x="512" y="256" text-anchor="middle"
+        font-family="Arial, Helvetica, DejaVu Sans, sans-serif"
+        font-size="${titleSize}" font-weight="700" fill="#FFFFFF">${tspans}</text>
+  ${plan ? `<text x="512" y="400" text-anchor="middle"
+        font-family="Arial, Helvetica, DejaVu Sans, sans-serif"
+        font-size="60" font-weight="500" fill="#E5E7EB">${esc(plan)}</text>` : ''}
+</svg>`;
+
 
   // If sharp is missing, return a single-layer SVG fallback buffer
   if (!_sharp) {
@@ -994,24 +999,22 @@ console.log('[img] Using image prompt:', prompt);
 }
 
 if (buf && buf.length) {
-  const composed = await composeTextOverBackground(buf, prod);
-  try { return await rehostToSupabase(composed, `${prod.name}_ai.png`, table); }
-  catch (e) { console.warn(`[img] rehost after ${provider} failed:`, e.message); }
-    } else if (provider === 'local') {
-      // ⚡ Local dynamic card (no external API, already includes text overlay)
-      try {
-        const localBuf = await createInitialImage(prod);
-        return await rehostToSupabase(localBuf, `${prod.name}_local.png`, table);
-      } catch (e) {
-        console.warn('[img] local createInitialImage failed:', e.message);
-      }
-    }
+  const composed = IMAGE_TEXT_OVERLAY
+    ? await composeTextOverBackground(buf, prod)
+    : buf; // no overlay, just the background
+  try {
+    return await rehostToSupabase(composed, `${prod.name}_ai.png`, table);
+  } catch (e) { console.warn(`[img] rehost after ${provider} failed:`, e.message); }
+}
   }
 
   // last resort: minimal gradient + overlay
-  const fallback = await composeTextOverBackground(gradientBackgroundSVG(), prod);
-  try { return await rehostToSupabase(fallback, `${prod.name}_fallback.png`, table); }
-  catch { return null; }
+  
+ const fallbackBase = gradientBackgroundSVG();
+const fallback = IMAGE_TEXT_OVERLAY
+  ? await composeTextOverBackground(fallbackBase, prod)
+  : fallbackBase;
+
 }
 
 
