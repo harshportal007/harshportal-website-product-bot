@@ -1616,40 +1616,80 @@ bot.action('cancel', (ctx) => {
 });
 
 bot.action('save', async (ctx) => {
-  if (!ctx.session.review) return ctx.answerCbQuery('Nothing to save');
-  await ctx.answerCbQuery('Saving…');
+  if (!isAdmin(ctx)) return;
+  if (!ctx.session?.review) return;
 
   const { prod, ai, table, updateId } = ctx.session.review;
-  const imgCol = table === TABLES.products ? 'image' : 'image_url';
-
-  const rest = table === TABLES.products
-    ? { name: prod.name, plan: prod.plan || null, validity: prod.validity || null, price: prod.price || null, originalPrice: prod.originalPrice || null, description: prod.description || ai.description || null, category: ai.category, subcategory: ai.subcategory || null, stock: prod.stock || null, tags: uniqMerge(prod.tags, ai.tags), features: ai.features || [], is_active: true, }
-    : { name: prod.name, description: prod.description || ai.description || null, price: prod.price || null, is_active: true, tags: uniqMerge(prod.tags, ai.tags), };
-
-  let error;
-  if (updateId) {
-    const { error: imgErr } = await supabase.from(table).update({ [imgCol]: prod.image }).eq('id', updateId);
-    if (imgErr) error = imgErr;
-    else ({ error } = await supabase.from(table).update(rest).eq('id', updateId));
-  } else {
-    const { data: dup } = await supabase.from(table).select('id').eq('name', prod.name).eq('price', prod.price).maybeSingle();
-    if (dup) {
-      await ctx.deleteMessage().catch(()=>{});
-      return ctx.reply(`⚠️ Product with same name & price exists (id: ${dup.id}). Cancelled save.`, kbAfterTask);
+const insertData = ctx.session.table === TABLES.products
+  ? {
+      name: prod.name,
+      plan: prod.plan || ai.plan || null,
+      validity: prod.validity || ai.validity || null,
+      price: prod.price || ai.price || null,
+      originalPrice: prod.originalPrice || null,
+      description: prod.description || ai.description || null,
+      category: prod.category || ai.category || null,
+      subcategory: prod.subcategory || ai.subcategory || null,
+      stock: prod.stock || null,
+      tags: uniqMerge(prod.tags, ai.tags),
+      features: ai.features || [],      // products table has this
+      image: prod.image,                // products: image
+      is_active: true
     }
-    ({ error } = await supabase.from(table).insert([{ ...rest, [imgCol]: prod.image }]));
-  }
+  : {
+      name: prod.name,
+      description: prod.description || ai.description || null,
+      price: prod.price || ai.price || null,
+      is_active: true,
+      tags: uniqMerge(prod.tags, ai.tags),
+      image_url: prod.image             // exclusive: save to image_url
+      // NO features here (column doesn't exist)
+    };
 
-  await ctx.deleteMessage().catch(()=>{});
-  if (error) await ctx.reply(`❌ Save failed: ${error.message}`);
-  else {
-    await ctx.reply(escapeMd(`✅ Saved to ${table}`), { parse_mode: 'MarkdownV2' });
-    await ctx.reply('What next?', kbAfterTask);
-  }
+  try {
+    if (updateId) {
+      const { error } = await supabase
+        .from(table)
+        .update(insertData)
+        .eq('id', updateId);
 
-  ctx.session.review = null;
-  ctx.session.mode = null;
+      if (error) throw error;
+      await ctx.reply('✅ Product updated successfully.');
+    } else {
+      const { data: existing } = await supabase
+        .from(table)
+        .select('id')
+        .eq('name', prod.name)
+        .eq('price', prod.price || ai.price || null)
+        .maybeSingle();
+
+      if (existing) {
+        await ctx.reply('⚠️ This product already exists.');
+        return;
+      }
+
+      const { error } = await supabase
+        .from(table)
+        .insert([insertData]);
+
+      if (error) throw error;
+      await ctx.reply('✅ Product added successfully.');
+    }
+
+    ctx.session.review = null;
+    ctx.session.await = null;
+    ctx.session.mode = null;
+
+    await ctx.reply('What next?', Markup.inlineKeyboard([
+      [Markup.button.callback('➕ Add Another', 'smartadd')],
+      [Markup.button.callback('🏁 Done', 'done')]
+    ]));
+  } catch (err) {
+    console.error(err);
+    await ctx.reply(`❌ Error saving: ${err.message}`);
+  }
 });
+
 
 /* ----- placeholders to preserve your "Unchanged" comments ----- */
 // ---- helpers to map DB row -> review objects ----
