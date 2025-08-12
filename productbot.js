@@ -471,11 +471,19 @@ async function composeTextOverBackground(backgroundBuffer, prod) {
   }
   const titleLines = wrapText(productName, 18, 2);
   const titleSize = titleLines.length > 1 ? 100 : 120;
-  const titleSvg = titleLines.map((line, idx) => `<tspan x="512" dy="${idx===0?0:'1.2em'}">${escXML(line)}</tspan>`).join('');
-  const textSvg = `<svg width="1024" height="512" viewBox="0 0 1024 512">
-    <text y="256" text-anchor="middle" font-family="Inter, Segoe UI, sans-serif" font-size="${titleSize}" font-weight="bold" fill="#FFFFFF">${titleSvg}</text>
-    ${planName ? `<text x="512" y="400" text-anchor="middle" font-family="Inter, Segoe UI, sans-serif" font-size="60" font-weight="500" fill="#E5E7EB">${escXML(planName)}</text>` : ''}
-  </svg>`;
+const titleSvg = titleLines
+  .map((line, idx) => `<tspan x="512" dy="${idx===0?0:'1.2em'}">${escXML(line)}</tspan>`)
+  .join('');
+
+const textSvg = `<svg width="1024" height="512" viewBox="0 0 1024 512" xmlns="http://www.w3.org/2000/svg">
+  <text x="512" y="256" text-anchor="middle"
+        font-family="Arial, Helvetica, DejaVu Sans, sans-serif"
+        font-size="${titleSize}" font-weight="700" fill="#FFFFFF">${titleSvg}</text>
+  ${planName ? `<text x="512" y="400" text-anchor="middle"
+        font-family="Arial, Helvetica, DejaVu Sans, sans-serif"
+        font-size="60" font-weight="500" fill="#E5E7EB">${escXML(planName)}</text>` : ''}
+</svg>`;
+
   const textBuffer = await _sharp(Buffer.from(textSvg)).png().toBuffer();
   return _sharp(backgroundBuffer)
     .composite([
@@ -1009,12 +1017,18 @@ if (buf && buf.length) {
   }
 
   // last resort: minimal gradient + overlay
-  
- const fallbackBase = gradientBackgroundSVG();
+ // last resort: minimal gradient (+ optional overlay), then host & return
+const fallbackBase = gradientBackgroundSVG();
 const fallback = IMAGE_TEXT_OVERLAY
   ? await composeTextOverBackground(fallbackBase, prod)
   : fallbackBase;
 
+try {
+  const hosted = await rehostToSupabase(fallback, `${prod.name}_fallback.png`, table);
+  return hosted;
+} catch (e) {
+  console.warn('[img] rehost fallback failed:', e.message);
+  return null;
 }
 
 
