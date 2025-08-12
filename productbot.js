@@ -865,6 +865,11 @@ async function geminiTextJSON(systemPrompt, userPrompt) {
 }
 
 
+function buildImagePrompt(prod) {
+  const name = prod?.name || 'Unnamed Product';
+  const plan = prod?.plan || '';
+  return `Cinematic, professional product background for "${name}" ${plan}, 4K, modern, clean, vibrant, soft lighting, high detail`;
+}
 
 
 // === Local dynamic card (no external APIs) ===
@@ -967,7 +972,8 @@ const kbTextAPIs = Markup.inlineKeyboard([
 
 /* ---- run generation with ordered providers, return hosted URL ---- */
 async function generateBackgroundWithOrder(prod, table, order = []) {
-  const prompt = buildBackgroundPrompt(prod);
+  const prompt = buildImagePrompt(prod);
+console.log('[img] Using image prompt:', prompt);
   for (const provider of order) {
     let buf = null;
 
