@@ -455,44 +455,50 @@ function gradientBackgroundSVG(width = 1024, height = 1024) {
 /* ---- compose overlay text on background ---- */
 const escXML = (s='') => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 async function composeTextOverBackground(backgroundBuffer, prod) {
-  if (!_sharp) return backgroundBuffer; // no sharp, just return background
-  const productName = shortBrandName(prod);
-  const planName = prod.plan || '';
+  if (!_sharp) return backgroundBuffer;
+
+const planName = (!prod.plan || /^(unknown|null|n\/a|na|none|-|\s*)$/i.test(String(prod.plan)))
+  ? ''
+  : String(prod.plan);
+
+
   function wrapText(text, maxWidth, maxLines) {
-    const words = text.split(' ');
-    let lines = [];
-    let current = words[0] || '';
-    for (let i=1;i<words.length;i++) {
-      if (current.length + words[i].length + 1 < maxWidth) current += ' ' + words[i];
-      else { lines.push(current); current = words[i]; }
+    const words = String(text||'').trim().split(/\s+/);
+    const lines = [];
+    let cur = '';
+    for (const w of words) {
+      if ((cur ? cur + ' ' : '') .length + w.length <= maxWidth) cur = (cur ? cur + ' ' : '') + w;
+      else { lines.push(cur); cur = w; if (lines.length >= maxLines-1) break; }
     }
-    lines.push(current);
+    if (cur) lines.push(cur);
     return lines.slice(0, maxLines);
   }
-  const titleLines = wrapText(productName, 18, 2);
-  const titleSize = titleLines.length > 1 ? 100 : 120;
-const titleSvg = titleLines
-  .map((line, idx) => `<tspan x="512" dy="${idx===0?0:'1.2em'}">${escXML(line)}</tspan>`)
-  .join('');
 
-const textSvg = `<svg width="1024" height="512" viewBox="0 0 1024 512" xmlns="http://www.w3.org/2000/svg">
-  <text x="512" y="256" text-anchor="middle"
-        font-family="Arial, Helvetica, DejaVu Sans, sans-serif"
-        font-size="${titleSize}" font-weight="700" fill="#FFFFFF">${titleSvg}</text>
-  ${planName ? `<text x="512" y="400" text-anchor="middle"
-        font-family="Arial, Helvetica, DejaVu Sans, sans-serif"
-        font-size="60" font-weight="500" fill="#E5E7EB">${escXML(planName)}</text>` : ''}
-</svg>`;
+const titleLines = wrapText(prod.name, 18, 2);
+  const titleSize  = titleLines.length > 1 ? 100 : 120;
+  const titleTspans = titleLines.map((line,i)=>`<tspan x="512" dy="${i===0?0:'1.2em'}">${escXML(line)}</tspan>`).join('');
+
+  const textSvg = `
+  <svg width="1024" height="512" viewBox="0 0 1024 512" xmlns="http://www.w3.org/2000/svg">
+    <text x="512" y="256" text-anchor="middle"
+          font-family="DejaVu Sans, Noto Sans, Liberation Sans, Arial, Helvetica, sans-serif"
+          font-size="${titleSize}" font-weight="700" fill="#FFFFFF">${titleTspans}</text>
+    ${planName ? `<text x="512" y="400" text-anchor="middle"
+          font-family="DejaVu Sans, Noto Sans, Liberation Sans, Arial, Helvetica, sans-serif"
+          font-size="60" font-weight="500" fill="#E5E7EB">${escXML(planName)}</text>` : ''}
+  </svg>`.trim();
 
   const textBuffer = await _sharp(Buffer.from(textSvg)).png().toBuffer();
+
   return _sharp(backgroundBuffer)
     .composite([
-      { input: Buffer.from('<svg width="1024" height="1024"><rect width="1024" height="1024" fill="black" opacity="0.4"/></svg>'), blend: 'multiply' },
-      { input: textBuffer, gravity: 'center' }
+      { input: Buffer.from('<svg width="1024" height="1024"><rect width="1024" height="1024" fill="black" opacity="0.40"/></svg>'), blend: 'multiply' },
+      { input: textBuffer, gravity: 'center' },
     ])
     .png()
     .toBuffer();
 }
+
 
 /* ---- 1) Pollinations (hosted, free) ---- */
 async function generateImageFromPollinations(prompt) {
@@ -965,6 +971,21 @@ function buildBackgroundPrompt(prod) {
 }
 
 /* ---- interactive API selection keyboard ---- */
+// near other keyboards
+const kbTextAPIs = Markup.inlineKeyboard([
+  [Markup.button.callback('🦙 Pollinations (SearchGPT)', 'txtapi_pollinations')],
+  [Markup.button.callback('🟪 Groq (Llama3-70B)', 'txtapi_groq')],
+  [Markup.button.callback('🔷 Gemini (rotation)', 'txtapi_gemini')],
+  [Markup.button.callback('🤖 Auto (best → fallback)', 'txtapi_auto')],
+  [Markup.button.callback('❌ Cancel', 'txtapi_cancel')],
+]);
+
+const kbBeforeImage = Markup.inlineKeyboard([
+  [Markup.button.callback('✅ Generate Image', 'confirm_generate_image')],
+  [Markup.button.callback('✏️ Edit Text', 'edit_text')],
+  [Markup.button.callback('❌ Cancel', 'cancel')],
+]);
+
 const kbImageAPIs = Markup.inlineKeyboard([
   [Markup.button.callback('🖼️ Pollinations (Free)', 'imgapi_pollinations')],
   [Markup.button.callback('🤗 Hugging Face', 'imgapi_hf')],
@@ -974,62 +995,71 @@ const kbImageAPIs = Markup.inlineKeyboard([
   [Markup.button.callback('❌ Cancel', 'imgapi_cancel')],
 ]);
 
-const kbTextAPIs = Markup.inlineKeyboard([
-  [Markup.button.callback('🦙 Pollinations (SearchGPT)', 'txtapi_pollinations')],
-  [Markup.button.callback('🟪 Groq (Llama3-70B)', 'txtapi_groq')],
-  [Markup.button.callback('🔷 Gemini (rotation)', 'txtapi_gemini')],
-  [Markup.button.callback('🤖 Auto (best → fallback)', 'txtapi_auto')],
-  [Markup.button.callback('❌ Cancel', 'txtapi_cancel')],
-]);
+
 
 
 /* ---- run generation with ordered providers, return hosted URL ---- */
 async function generateBackgroundWithOrder(prod, table, order = []) {
   const prompt = buildImagePrompt(prod);
-console.log('[img] Using image prompt:', prompt);
+  console.log('[img] Using image prompt:', prompt);
+
   for (const provider of order) {
     let buf = null;
 
-  if (provider === 'pollinations') {
-  buf = await tryWithRetries('image:pollinations', () => generateImageFromPollinations(prompt), IMAGE_RETRIES);
-} else if (provider === 'hf') {
-  buf = await tryWithRetries('image:hf', () => generateImageFromHuggingFace(prompt), IMAGE_RETRIES);
-} else if (provider === 'deepai') {
-  buf = await tryWithRetries('image:deepai', () => generateImageFromDeepAI(prompt), IMAGE_RETRIES);
-} else if (provider === 'local') {
+    if (provider === 'pollinations') {
+      buf = await tryWithRetries('image:pollinations', () => generateImageFromPollinations(prompt), IMAGE_RETRIES);
+      if (buf && buf.length) {
+        const composed = IMAGE_TEXT_OVERLAY ? await composeTextOverBackground(buf, prod) : buf;
+        try { return await rehostToSupabase(composed, `${prod.name}_ai.png`, table); }
+        catch (e) { console.warn('[img] rehost after pollinations failed:', e.message); }
+      }
+      continue;
+    }
+
+    if (provider === 'hf') {
+      // HF is our creative fallback – always add text overlay
+      buf = await tryWithRetries('image:hf', () => generateImageFromHuggingFace(prompt), IMAGE_RETRIES);
+      if (buf && buf.length) {
+        const composed = await composeTextOverBackground(buf, prod);
+        try { return await rehostToSupabase(composed, `${prod.name}_ai.png`, table); }
+        catch (e) { console.warn('[img] rehost after hf failed:', e.message); }
+      }
+      continue;
+    }
+
+    if (provider === 'deepai') {
+      buf = await tryWithRetries('image:deepai', () => generateImageFromDeepAI(prompt), IMAGE_RETRIES);
+      if (buf && buf.length) {
+        const composed = IMAGE_TEXT_OVERLAY ? await composeTextOverBackground(buf, prod) : buf;
+        try { return await rehostToSupabase(composed, `${prod.name}_ai.png`, table); }
+        catch (e) { console.warn('[img] rehost after deepai failed:', e.message); }
+      }
+      continue;
+    }
+
+    if (provider === 'local') {
+      // Ultimate safety net – local dynamic card (already includes title/plan)
+      try {
+        const localBuf = await createInitialImage(prod);
+        return await rehostToSupabase(localBuf, `${prod.name}_local.png`, table);
+      } catch (e) {
+        console.warn('[img] local createInitialImage failed:', e.message);
+      }
+      continue;
+    }
+  }
+
+  // Final safety: gradient (+ overlay) and return it
   try {
-    const localBuf = await createInitialImage(prod);
-    return await rehostToSupabase(localBuf, `${prod.name}_local.png`, table);
+    const base = gradientBackgroundSVG();
+    const finalBuf = IMAGE_TEXT_OVERLAY ? await composeTextOverBackground(base, prod) : base;
+    return await rehostToSupabase(finalBuf, `${prod.name}_fallback.png`, table);
   } catch (e) {
-    console.warn('[img] local createInitialImage failed:', e.message);
+    console.warn('[img] gradient fallback failed:', e.message);
+    return null;
   }
-  continue;
 }
 
-if (buf && buf.length) {
-  const composed = IMAGE_TEXT_OVERLAY
-    ? await composeTextOverBackground(buf, prod)
-    : buf; // no overlay, just the background
-  try {
-    return await rehostToSupabase(composed, `${prod.name}_ai.png`, table);
-  } catch (e) { console.warn(`[img] rehost after ${provider} failed:`, e.message); }
-}
-  }
-
-  // last resort: minimal gradient + overlay
- // last resort: minimal gradient (+ optional overlay), then host & return
-const fallbackBase = gradientBackgroundSVG();
-const fallback = IMAGE_TEXT_OVERLAY
-  ? await composeTextOverBackground(fallbackBase, prod)
-  : fallbackBase;
-
-try {
-  const hosted = await rehostToSupabase(fallback, `${prod.name}_fallback.png`, table);
-  return hosted;
-} catch (e) {
-  console.warn('[img] rehost fallback failed:', e.message);
-  return null;
-}
 
 
 /* --------------------- keyboards / messages & Rest --------------------- */
@@ -1241,103 +1271,75 @@ const smartAddHandler = async (ctx) => {
 
   try {
     const urlMatch = Array.from(text.matchAll(URL_RX)).map(m => m[0])[0] || null;
-const guessedName = text.split('\n')[0].trim();
+    const guessedName = text.split('\n')[0].trim();
 
-// 1) user URL > 2) brand slug > 3) search-based official domain (typo fixer)
-let domain = urlMatch || resolveBrandDomain(guessedName);
-if (!urlMatch && !domain && typeof pickOfficialDomainFromSearch === 'function') {
-  try {
-    const bestHost = await pickOfficialDomainFromSearch(guessedName);
-    if (bestHost) domain = `https://${bestHost}`;
-  } catch {}
-}
-
-let websiteContent = '';
-let structured = null;
-let meta = {};
-let ogImageFromPage = null;
-
-if (domain) {
-  const fullUrl = domain.startsWith('http') ? domain : `https://${domain}`;
-  await ctx.reply(`🌐 Reading ${fullUrl} ...`);
-  const { html, text: pageText } = await fetchWebsiteRaw(fullUrl);
-  websiteContent = pageText;
-  if (html) {
-    structured = extractJsonLdProduct(html);
-    meta = extractMetaTags(html);
-    ogImageFromPage = meta.ogImage || null;
-  }
-} else {
-  await ctx.reply('🔎 Couldn’t auto-detect the official site. I’ll rely on web search evidence.');
-}
-
-
-    // AI parse
-   // TEXT MODEL CHOICE (once per session or per product)
-if (!ctx.session.textOrder) {
-  console.log('[text] no textOrder; asking user to choose text model');
- ctx.session.await = 'choose_text_api';
-ctx.session.pendingSmart = { text, websiteContent, ogImageFromPage }; // <-- keep OG image too
-await ctx.reply('Choose which **text model** to fill product details (I’ll retry and fallback automatically):', kbTextAPIs);
-return;
-}
-console.log('[text] using textOrder =', ctx.session.textOrder);
-
-
-
-// AI parse with chosen order
-const aiData = await runEnrichment(ctx, text, websiteContent);
-
- await ctx.reply(
-  `📝 Parsed:
-• Name: ${aiData.name}
-• Plan: ${aiData.plan}
-• Validity: ${aiData.validity}
-• Price: ${aiData.price ?? '-'}
-• Category: ${aiData.category}
-(Generating/choosing image next…)`
-).catch(e => console.error('[tg] reply Parsed failed:', e));
-
-
-    const prod = { ...aiData, image: null };
-
-    // Try page OG image first
-    if (ogImageFromPage) {
-        console.log('[img] starting image step; ogImageFromPage=', !!ogImageFromPage);
+    // 1) user URL > 2) brand slug > 3) search-based official domain (typo fixer)
+    let domain = urlMatch || resolveBrandDomain(guessedName);
+    if (!urlMatch && !domain && typeof pickOfficialDomainFromSearch === 'function') {
       try {
-        prod.image = await rehostToSupabase(ogImageFromPage, `${prod.name}.jpg`, ctx.session.table);
-      } catch (e) { console.warn('[img] OG rehost failed:', e.message); }
-    }
-    // Try brand sources if still empty
-    if (!prod.image) {
-      const hosted = await tryBrandImages(prod, ctx.session.table);
-      if (hosted) prod.image = hosted;
+        const bestHost = await pickOfficialDomainFromSearch(guessedName);
+        if (bestHost) domain = `https://${bestHost}`;
+      } catch {}
     }
 
-    // Prepare session review
-    ctx.session.review = { prod, ai: aiData, table: ctx.session.table };
-    ctx.session.mode = null;
+    let websiteContent = '';
+    let structured = null;
+    let meta = {};
+    let ogImageFromPage = null;
 
-    if (prod.image) {
-      // We have an image, present review immediately
-      const caption = reviewMessage(prod, aiData, ctx.session.table);
-      return prod.image
-        ? ctx.replyWithPhoto({ url: prod.image }, { caption, parse_mode: 'Markdown', ...kbConfirm })
-        : replyMD(ctx, caption, kbConfirm);
+    if (domain) {
+      const fullUrl = domain.startsWith('http') ? domain : `https://${domain}`;
+      await ctx.reply(`🌐 Reading ${fullUrl} ...`);
+      const { html, text: pageText } = await fetchWebsiteRaw(fullUrl);
+      websiteContent = pageText;
+      if (html) {
+        structured = extractJsonLdProduct(html);
+        meta = extractMetaTags(html);
+        ogImageFromPage = meta.ogImage || null;
+      }
     } else {
-      // No image yet — ask user which API to use
-      ctx.session.await = 'choose_image_api';
-      ctx.session.pendingImage = { table: ctx.session.table };
-      await ctx.reply('Choose which image API to use first (fallbacks will be tried automatically if it fails):', kbImageAPIs);
+      await ctx.reply('🔎 Couldn’t auto-detect the official site. I’ll rely on web search evidence.');
+    }
+
+    // TEXT MODEL CHOICE (once per session or per product)
+    if (!ctx.session.textOrder) {
+      console.log('[text] no textOrder; asking user to choose text model');
+      ctx.session.await = 'choose_text_api';
+      ctx.session.pendingSmart = { text, websiteContent, ogImageFromPage }; // keep OG image too
+      await ctx.reply('Choose which **text model** to fill product details (I’ll retry and fallback automatically):', kbTextAPIs);
       return;
     }
+    console.log('[text] using textOrder =', ctx.session.textOrder);
 
+    // AI parse with chosen order
+    const aiData = await runEnrichment(ctx, text, websiteContent);
+
+    // Prepare product with parsed text (no image yet)
+    const prod = { ...aiData, image: null };
+    ctx.session.review = { prod, ai: aiData, table: ctx.session.table, ogImageFromPage };
+    ctx.session.mode = null;
+
+    // Show text-only review and let user edit OR generate image
+    const msg = [
+      '📝 *Parsed (Review & Edit)*',
+      `*Name:* ${escapeMd(aiData.name)}`,
+      `*Plan:* ${escapeMd(aiData.plan)}`,
+      `*Validity:* ${escapeMd(aiData.validity)}`,
+      `*Price:* ${escapeMd(aiData.price ?? '-')}`,
+      `*Category:* ${escapeMd(aiData.category)}`,
+      '',
+      'Tap *Generate Image* when the text looks good.',
+    ].join('\n');
+
+    await replyMD(ctx, msg, kbBeforeImage);
+    return; // ⛔️ do NOT start image generation here
   } catch (e) {
     console.error('Smart add flow failed:', e);
     await ctx.reply(`❌ An error occurred: ${e.message}. Please try again.`);
     ctx.session = { table: ctx.session.table };
   }
-};
+}; 
+
 
 async function resumeSmartAddAfterTextChoice(ctx) {
   const pending = ctx.session.pendingSmart;
@@ -1346,42 +1348,29 @@ async function resumeSmartAddAfterTextChoice(ctx) {
   ctx.session.pendingSmart = null;
   const { text, websiteContent, ogImageFromPage } = pending;
 
-  const aiData = await runEnrichment(ctx, text, websiteContent);
 
-  await ctx.reply(
-    `📝 Parsed:
-• Name: ${aiData.name}
-• Plan: ${aiData.plan}
-• Validity: ${aiData.validity}
-• Price: ${aiData.price ?? '-'}
-• Category: ${aiData.category}
-(Generating/choosing image next…)`
-  ).catch(e => console.error('[tg] reply Parsed failed:', e));
+const aiData = await runEnrichment(ctx, text, websiteContent);
 
-  const prod = { ...aiData, image: null };
+// Prepare product with parsed text (no image yet)
+const prod = { ...aiData, image: null };
+ctx.session.review = { prod, ai: aiData, table: ctx.session.table, ogImageFromPage };
+ctx.session.mode = null;
 
-  // try OG first
-  if (ogImageFromPage) {
-    try {
-      prod.image = await rehostToSupabase(ogImageFromPage, `${prod.name}.jpg`, ctx.session.table);
-    } catch (e) { console.warn('[img] OG rehost failed:', e.message); }
-  }
-  if (!prod.image) {
-    const hosted = await tryBrandImages(prod, ctx.session.table);
-    if (hosted) prod.image = hosted;
-  }
+// Show text-only review and let user edit OR generate image
+const msg = [
+  '📝 *Parsed (Review & Edit)*',
+  `*Name:* ${escapeMd(aiData.name)}`,
+  `*Plan:* ${escapeMd(aiData.plan)}`,
+  `*Validity:* ${escapeMd(aiData.validity)}`,
+  `*Price:* ${escapeMd(aiData.price ?? '-')}`,
+  `*Category:* ${escapeMd(aiData.category)}`,
+  '',
+  'Tap *Generate Image* when the text looks good.',
+].join('\n');
 
-  ctx.session.review = { prod, ai: aiData, table: ctx.session.table };
-  ctx.session.mode = null;
+await replyMD(ctx, msg, kbBeforeImage);
+return; // ⛔️ do NOT start image generation here
 
-  if (prod.image) {
-    const caption = reviewMessage(prod, aiData, ctx.session.table);
-    return ctx.replyWithPhoto({ url: prod.image }, { caption, parse_mode: 'Markdown', ...kbConfirm });
-  } else {
-    ctx.session.await = 'choose_image_api';
-    ctx.session.pendingImage = { table: ctx.session.table };
-    return ctx.reply('Choose which image API to use first (fallbacks will be tried automatically if it fails):', kbImageAPIs);
-  }
 }
 
 
@@ -1397,6 +1386,25 @@ async function presentReview(ctx) {
     return replyMD(ctx, caption, kbConfirm);
   }
 }
+
+async function presentTextReview(ctx) {
+  if (!ctx.session?.review) return;
+  const { ai, prod } = ctx.session.review;
+  const a = ai || {};
+  const p = prod || {};
+  const msg = [
+    '📝 *Parsed (Review & Edit)*',
+    `*Name:* ${escapeMd(p.name || a.name || '-')}`,
+    `*Plan:* ${escapeMd(p.plan || a.plan || '-')}`,
+    `*Validity:* ${escapeMd(p.validity || a.validity || '-')}`,
+    `*Price:* ${escapeMd(p.price ?? a.price ?? '-')}`,
+    `*Category:* ${escapeMd(a.category || '-')}`,
+    '',
+    'Tap *Generate Image* when the text looks good.',
+  ].join('\n');
+  return replyMD(ctx, msg, kbBeforeImage);
+}
+
 
 /* ----- inline edit apply ----- */
 async function applyInlineEdit(ctx) {
@@ -1419,7 +1427,8 @@ async function applyInlineEdit(ctx) {
   ctx.session.await = null;
   ctx.session.edit = null;
 
-  await presentReview(ctx);
+ await presentTextReview(ctx); // still in text stage
+
 }
 
 /* ----- text handler ----- */
@@ -1476,6 +1485,76 @@ bot.on('text', async (ctx, next) => {
   }
 
   return next();
+});
+
+bot.action('confirm_generate_image', async (ctx) => {
+  if (!ctx.session?.review) return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  await ctx.deleteMessage().catch(()=>{});
+
+  const { prod } = ctx.session.review;
+  const table = ctx.session.review.table;
+
+  await ctx.reply('🎯 Confirmed. Looking for an official image first…');
+
+  // Try brand/OG first
+  if (!prod.image) {
+    const hosted = await tryBrandImages(prod, table);
+    if (hosted) prod.image = hosted;
+  }
+
+  if (prod.image) {
+    // Show final review with image & Save
+    const caption = reviewMessage(prod, ctx.session.review.ai, table);
+    return ctx.replyWithPhoto({ url: prod.image }, { caption, parse_mode: 'Markdown', ...kbConfirm });
+  } else {
+    // Ask which generator to use (your existing flow)
+    ctx.session.await = 'choose_image_api';
+    ctx.session.pendingImage = { table };
+    await ctx.reply('Choose which image API to use:', kbImageAPIs);
+  }
+});
+
+bot.action('gen_image_now', async (ctx) => {
+  if (!ctx.session.review) return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  await ctx.deleteMessage().catch(()=>{});
+  await ctx.reply('🎨 Generating product image...');
+
+  const { prod, table, ogImageFromPage } = ctx.session.review;
+
+  // 1) Try OG image from page (if any)
+  if (ogImageFromPage && !prod.image) {
+    try {
+      prod.image = await rehostToSupabase(ogImageFromPage, `${prod.name}.jpg`, table);
+    } catch (e) {
+      console.warn('[img] OG rehost failed:', e.message);
+    }
+  }
+
+  // 2) Try brand/logo/search
+  if (!prod.image) {
+    try {
+      const hosted = await tryBrandImages(prod, table);
+      if (hosted) prod.image = hosted;
+    } catch (e) {
+      console.warn('[img] tryBrandImages failed:', e.message);
+    }
+  }
+
+  // 3) If still nothing, run your configured image providers
+  if (!prod.image) {
+    const hosted = await generateBackgroundWithOrder(prod, table, ['pollinations','hf','deepai','local']); // or whatever order you prefer
+    if (hosted) prod.image = hosted;
+    else {
+      // last resort fallback
+      const fb = await composeTextOverBackground(gradientBackgroundSVG(), prod);
+      prod.image = await rehostToSupabase(fb, `${prod.name}_fallback.png`, table);
+    }
+  }
+
+  // Show the normal review with image + Save/Edit
+  return presentReview(ctx);
 });
 
 
@@ -1573,10 +1652,89 @@ bot.action('save', async (ctx) => {
 });
 
 /* ----- placeholders to preserve your "Unchanged" comments ----- */
-bot.action('edit', async (_ctx) => { /* Unchanged */ });
-bot.action(/^edit_(.+)$/, (_ctx) => { /* Unchanged */ });
-bot.action('back_review', async (_ctx) => { /* Unchanged */ });
-bot.command('update', async (_ctx) => { /* Unchanged */ });
+// ---- helpers to map DB row -> review objects ----
+function rowToReview(table, row) {
+  const isProducts = table === TABLES.products;
+  const imgCol = isProducts ? 'image' : 'image_url';
+
+  // what the user can edit directly (text & simple fields)
+  const prod = {
+    name: row.name || '',
+    plan: row.plan ?? null,
+    validity: row.validity ?? null,
+    price: row.price ?? null,
+    originalPrice: isProducts ? (row.originalPrice ?? null) : undefined,
+    stock: isProducts ? (row.stock ?? null) : undefined,
+    description: row.description || '',
+    tags: Array.isArray(row.tags) ? row.tags : (row.tags ? String(row.tags).split(',').map(s=>s.trim()) : []),
+    image: row[imgCol] || null,
+    category: isProducts ? (row.category || null) : undefined,
+    subcategory: isProducts ? (row.subcategory || null) : undefined,
+  };
+
+  // what AI normally fills (keep consistent with your save flow)
+  const ai = {
+    description: row.description || '',
+    category: isProducts ? (row.category || 'Download') : 'Download',
+    subcategory: isProducts ? (row.subcategory || 'unknown') : 'unknown',
+    tags: Array.isArray(row.tags) ? row.tags : [],
+    features: Array.isArray(row.features) ? row.features : [],
+    name: row.name || '',
+    plan: row.plan ?? 'unknown',
+    validity: row.validity ?? 'unknown',
+    price: row.price ?? null,
+  };
+
+  return { prod, ai };
+}
+
+// ---- /update command ----
+bot.command('update', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  if (!ctx.session.table) return ctx.reply('Choose table first with /table');
+
+  const parts = (ctx.message?.text || '').trim().split(/\s+/);
+  const id = parts[1];
+  if (!id) return ctx.reply('Usage: /update <id>');
+
+  // fetch the row
+  const selCols = ctx.session.table === TABLES.products
+    ? 'id,name,plan,validity,price,originalPrice,description,category,subcategory,stock,tags,features,image,is_active'
+    : 'id,name,description,price,tags,features,image_url,is_active';
+
+  const { data: row, error } = await supabase
+    .from(ctx.session.table)
+    .select(selCols)
+    .eq('id', id)
+    .maybeSingle();
+
+  if (error) return ctx.reply(`DB error: ${error.message}`);
+  if (!row) return ctx.reply('Not found.');
+
+  // build review state (reuses your existing save/update flow)
+  const { prod, ai } = rowToReview(ctx.session.table, row);
+
+  ctx.session.review = {
+    prod,
+    ai,
+    table: ctx.session.table,
+    updateId: row.id,
+    ogImageFromPage: null,
+  };
+  ctx.session.mode = null;
+  ctx.session.await = null;
+
+  // show editable review
+  await presentReview(ctx);
+});
+
+// ---- back to review after editing which field ----
+bot.action('back_review', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  if (!ctx.session?.review) { await ctx.answerCbQuery(); return; }
+  await ctx.answerCbQuery();
+  await presentReview(ctx);
+});
 
 /* --------------------- error & lifecycle --------------------- */
 bot.catch((err, ctx) => {
