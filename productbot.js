@@ -22,8 +22,10 @@ const HF_KEY = process.env.HUGGING_FACE_API_KEY || '';
 const DEEPAI_KEY = process.env.DEEPAI_API_KEY || '';
 const IMAGE_TEXT_OVERLAY = (process.env.IMAGE_TEXT_OVERLAY || '1') === '1';
 
-// near the other env reads
-// Gemini config — SINGLE SOURCE OF TRUTH
+const CF_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID || '';
+const CF_API_TOKEN  = process.env.CLOUDFLARE_API_TOKEN  || '';
+
+// Gemini config
 const GEMINI_KEYS = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '')
   .split(',')
   .map(s => s.trim())
@@ -31,7 +33,6 @@ const GEMINI_KEYS = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY |
 
 const GEMINI_TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-pro';
 const GEMINI_BASE = process.env.GEMINI_BASE || 'https://generativelanguage.googleapis.com/v1beta';
-
 
 /* -------------------- config -------------------- */
 const ADMIN_IDS = (process.env.ADMIN_IDS || '7057639075')
@@ -51,6 +52,34 @@ const groq = new OpenAI({
 const hf = new HfInference(HF_KEY);
 const HF_IMAGE_MODEL = 'stabilityai/stable-diffusion-xl-base-1.0';
 
+/* ---- idle / pause control ---- */
+const INACTIVITY_MS = Math.max(0, parseInt(process.env.INACTIVITY_MS || '300000', 10));
+const idleTimers = new Map(); // userId -> timeout handle
+
+function clearIdleTimer(userId) {
+  const h = idleTimers.get(userId);
+  if (h) { clearTimeout(h); idleTimers.delete(userId); }
+}
+
+async function triggerPause(ctx) {
+  try {
+    ctx.session.paused = true;
+    await ctx.reply(
+      '⏸️ Bot paused due to inactivity.',
+      Markup.inlineKeyboard([[Markup.button.callback('▶️ Start', 'resume_bot')]])
+    );
+  } catch {}
+}
+
+function startIdleTimer(ctx) {
+  if (!isAdmin(ctx) || INACTIVITY_MS <= 0) return;
+  const uid = ctx.from.id;
+  clearIdleTimer(uid);
+  const h = setTimeout(() => triggerPause(ctx), INACTIVITY_MS);
+  idleTimers.set(uid, h);
+}
+
+
 /* -------------------- utils -------------------- */
 const isAdmin = (ctx) => !!ctx?.from && ADMIN_IDS.includes(ctx.from.id);
 const ok = (x) => typeof x !== 'undefined' && x !== null && x !== '';
@@ -67,6 +96,38 @@ function safeParseFirstJsonObject(s) {
   const m = s.match(/\{[\s\S]*\}/m);
   if (!m) return null;
   try { return JSON.parse(m[0]); } catch { return null; }
+}
+
+function sniffImageType(buf = Buffer.alloc(0)) {
+  // very small magic-number sniffer for common types
+  if (buf.slice(0, 8).equals(Buffer.from([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]))) {
+    return { mime: 'image/png', ext: '.png' };
+  }
+  if (buf.slice(0, 3).equals(Buffer.from([0xFF,0xD8,0xFF]))) {
+    return { mime: 'image/jpeg', ext: '.jpg' };
+  }
+  if (buf.slice(0, 12).equals(Buffer.from([0x52,0x49,0x46,0x46,0,0,0,0,0x57,0x45,0x42,0x50]))) {
+    // "RIFF????WEBP"
+    return { mime: 'image/webp', ext: '.webp' };
+  }
+  if (buf.slice(0, 5).toString('utf8') === '<?xml' || buf.slice(0, 4).toString('utf8') === '<svg') {
+    return { mime: 'image/svg+xml', ext: '.svg' };
+  }
+  return { mime: 'application/octet-stream', ext: '' };
+}
+
+function extFromName(name=''){
+  const m = String(name).toLowerCase().match(/\.(png|jpe?g|webp|svg)$/i);
+  return m ? `.${m[1].toLowerCase().replace('jpeg','jpg')}` : '';
+}
+
+function mimeFromExt(ext=''){
+  const e = ext.toLowerCase();
+  if (e === '.png') return 'image/png';
+  if (e === '.jpg' || e === '.jpeg') return 'image/jpeg';
+  if (e === '.webp') return 'image/webp';
+  if (e === '.svg') return 'image/svg+xml';
+  return null;
 }
 
 // --- helpers ---
@@ -87,7 +148,6 @@ function levenshtein(a, b){
   return dp[m][n];
 }
 
-
 // --- tiny sleep + retry wrapper ---
 const sleep = (ms)=>new Promise(r=>setTimeout(r, ms));
 async function tryWithRetries(label, fn, attempts = 2, baseDelay = 800) {
@@ -96,7 +156,7 @@ async function tryWithRetries(label, fn, attempts = 2, baseDelay = 800) {
     try { return await fn(i); } catch (e) {
       lastErr = e;
       console.warn(`[retry] ${label} attempt ${i+1} failed: ${e.message}`);
-      await sleep(baseDelay * Math.pow(2, i)); // backoff
+      await sleep(baseDelay * Math.pow(2, i));
     }
   }
   if (lastErr) console.warn(`[retry] ${label} giving up after ${attempts} attempts: ${lastErr.message}`);
@@ -104,37 +164,6 @@ async function tryWithRetries(label, fn, attempts = 2, baseDelay = 800) {
 }
 const TEXT_RETRIES = Math.max(1, parseInt(process.env.TEXT_RETRIES||'2',10));
 const IMAGE_RETRIES = Math.max(1, parseInt(process.env.IMAGE_RETRIES||'2',10));
-
-// Try to guess the official domain from search results
-// Try to guess the official domain from search results (uses both DDG modes)
-async function pickOfficialDomainFromSearch(brandName){
-  const urls = new Set();
-  try {
-    const a = await ddgSearchHTML(brandName, 10);
-    a.forEach(u => urls.add(u));
-  } catch {}
-  try {
-    const b = await ddgSearchLite(brandName, 10);
-    b.forEach(u => urls.add(u));
-  } catch {}
-
-  const hosts = Array.from(urls).map(hostOf).filter(Boolean);
-  if (!hosts.length) return null;
-
-  const brand = String(brandName||'').toLowerCase().replace(/[^a-z0-9]+/g,'');
-  let best = null, bestScore = Infinity;
-  for (const h of hosts) {
-    const base = stripTLD(h).toLowerCase().replace(/[^a-z0-9]+/g,'');
-    const d = levenshtein(brand, base);
-    if (d < bestScore) { bestScore = d; best = h; }
-  }
-  return bestScore <= 3 ? best : null;
-}
-
-
-
-
-
 
 /* ---------------- category helpers ---------------- */
 function normalizeCategory(prodLike = {}, aiCategory) {
@@ -176,7 +205,7 @@ async function fetchWebsiteRaw(url) {
     }
   } catch {}
 
-  // 2) fallback: readable proxy (handles JS-heavy / blocked sites)
+  // 2) fallback: readable proxy
   try {
     const proxied = normalized.replace(/^https?:\/\//, '');
     const res2 = await fetch(`https://r.jina.ai/http://${proxied}`, {
@@ -185,7 +214,6 @@ async function fetchWebsiteRaw(url) {
     });
     if (res2.ok) {
       const txt = await res2.text();
-      // r.jina.ai returns already-extracted text
       if (txt && txt.length > 200) return { html: '', text: txt.slice(0, 20000) };
     }
   } catch {}
@@ -196,7 +224,7 @@ async function fetchWebsiteRaw(url) {
 // provider runner -> returns parsed JSON or null
 async function getTextFromProvider(provider, systemPrompt, userPrompt) {
   if (provider === 'pollinations') {
-    return await pollinationsTextJSON(systemPrompt, userPrompt, 'searchgpt'); // strongest first
+    return await pollinationsTextJSON(systemPrompt, userPrompt, 'searchgpt');
   }
   if (provider === 'groq') {
     try {
@@ -219,7 +247,6 @@ async function getTextFromProvider(provider, systemPrompt, userPrompt) {
   }
   return null;
 }
-
 
 function extractMetaTags(html = '') {
   const pick = (prop, attr='property') => {
@@ -279,34 +306,62 @@ async function tgFileUrl(fileId) {
 }
 
 async function rehostToSupabase(fileUrlOrBuffer, filenameHint = 'image.jpg', table) {
-  const buf = Buffer.isBuffer(fileUrlOrBuffer)
-    ? fileUrlOrBuffer
-    : await (async () => {
-        const res = await fetch(fileUrlOrBuffer, {
-          signal: typeof AbortSignal?.timeout==='function' ? AbortSignal.timeout(15000) : undefined,
-        });
-        if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
-        const ab = await res.arrayBuffer();
-        return Buffer.from(ab);
-      })();
+  // 1) get bytes + any server-declared content-type
+  let buf, serverType = null, finalName = sanitizeForFilename(filenameHint || 'image');
+  if (Buffer.isBuffer(fileUrlOrBuffer)) {
+    buf = fileUrlOrBuffer;
+  } else {
+    const res = await fetch(fileUrlOrBuffer, {
+      signal: typeof AbortSignal?.timeout==='function' ? AbortSignal.timeout(15000) : undefined,
+    });
+    if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
+    serverType = res.headers.get('content-type');
+    const ab = await res.arrayBuffer();
+    buf = Buffer.from(ab);
 
+    // if URL provides a better filename (via path), use its extension
+    try {
+      const u = new URL(fileUrlOrBuffer);
+      const urlExt = extFromName(u.pathname);
+      if (urlExt && !extFromName(finalName)) finalName += urlExt;
+    } catch {}
+  }
+
+  // 2) decide mime & extension
+  const hintExt = extFromName(finalName);
+  let mime = (serverType && serverType.startsWith('image/')) ? serverType.split(';')[0] : mimeFromExt(hintExt);
+  if (!mime || mime === 'application/octet-stream') {
+    const sniff = sniffImageType(buf);
+    if (!hintExt && sniff.ext) finalName += sniff.ext;
+    if (!mime || mime === 'application/octet-stream') mime = sniff.mime;
+  }
+  if (!extFromName(finalName)) {
+    // last resort default
+    finalName += '.jpg';
+    if (mime === 'application/octet-stream') mime = 'image/jpeg';
+  }
+
+  // 3) choose bucket/path
   const bucket = table === TABLES.products
     ? (process.env.SUPABASE_BUCKET_PRODUCTS || 'images')
     : (process.env.SUPABASE_BUCKET_EXCLUSIVE || 'exclusiveproduct-images');
 
   const folder = table === TABLES.products ? 'products' : 'exclusive-products';
-  const key = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2)}-${sanitizeForFilename(filenameHint)}`;
+  const key = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2)}-${sanitizeForFilename(finalName)}`;
 
-  console.log(`[upload] Uploading ${filenameHint} to Supabase bucket ${bucket} at path ${key}`);
-  const { error: upErr } = await supabase.storage.from(bucket).upload(key, buf, { upsert: true });
+  console.log(`[upload] ${finalName} -> bucket=${bucket}, key=${key}, type=${mime}`);
+
+  // 4) upload WITH contentType so Supabase serves it as an image
+  const { error: upErr } = await supabase.storage.from(bucket).upload(key, buf, {
+    upsert: true,
+    contentType: mime || 'image/jpeg',
+    cacheControl: 'public, max-age=31536000, immutable'
+  });
   if (upErr) throw upErr;
+
+  // 5) public URL
   const { data: pub } = supabase.storage.from(bucket).getPublicUrl(key);
   return pub.publicUrl;
-}
-
-async function ensureHostedInSupabase(u, table, filenameHint='prod.jpg') {
-  if (!u || !/^https?:\/\//i.test(u)) return u;
-  return rehostToSupabase(u, filenameHint, table);
 }
 
 /* -------------------- AI enrichment -------------------- */
@@ -346,20 +401,16 @@ Rules:
 4) Category must be one of: ${CATEGORIES_ALLOWED.join(' | ')}.
 5) If some field is unknown, use "unknown". Return JSON only.`;
 
-  // resolve provider order: explicit arg -> session -> env -> default
   const providerOrder =
     (Array.isArray(providerOrderParam) && providerOrderParam.length && providerOrderParam) ||
-    (Array.isArray(this?.ctx?.session?.textOrder) && this.ctx.session.textOrder.length && this.ctx.session.textOrder) ||
     (process.env.TEXT_PROVIDER_ORDER
       ? process.env.TEXT_PROVIDER_ORDER.split(',').map(s=>s.trim()).filter(Boolean)
       : ['pollinations','groq','gemini']);
   console.log('[text] providerOrder resolved to:', providerOrder);
 
-  // 🔧 CALL THE PROVIDERS (this was missing)
   const { json: got, provider } = await runTextProvidersWithOrder(providerOrder, systemPrompt, userPrompt);
   let json = got;
 
-  // minimal fallback
   if (!json) {
     console.error('[text] All providers failed. Using minimal extraction.');
     const name = cleanTextHints.split('\n')[0].trim() || 'Product';
@@ -375,7 +426,6 @@ Rules:
     };
   }
 
-  // normalize
   json.name = json.name || guessedName || 'Product';
   json.plan = json.plan || planGuess || 'unknown';
   json.validity = json.validity || 'unknown';
@@ -383,7 +433,6 @@ Rules:
   if (!Array.isArray(json.tags)) json.tags = (json.tags ? String(json.tags) : '').split(/[;,]/).map(s=>s.trim()).filter(Boolean);
   if (!Array.isArray(json.features)) json.features = [];
 
-  // second pass if thin
   const needDetail = (!json.description || json.description.length < 150 || json.features.length < 3);
   if (needDetail && combinedSite.length > 400) {
     try {
@@ -414,7 +463,6 @@ Sources:
   return json;
 }
 
-
 async function runTextProvidersWithOrder(order, systemPrompt, userPrompt) {
   for (const provider of order) {
     console.log('[text] trying provider:', provider);
@@ -432,11 +480,7 @@ async function runTextProvidersWithOrder(order, systemPrompt, userPrompt) {
   return { json: null, provider: null };
 }
 
-
-
-/* ===================== IMAGE GENERATION: Providers + Flow ===================== */
-
-/* ---- 0) simple gradient fallback (never fails) ---- */
+/* ===================== IMAGE GENERATION ===================== */
 function gradientBackgroundSVG(width = 1024, height = 1024) {
   const svg = `
   <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
@@ -452,55 +496,106 @@ function gradientBackgroundSVG(width = 1024, height = 1024) {
   return Buffer.from(svg);
 }
 
-/* ---- compose overlay text on background ---- */
+
+
 const escXML = (s='') => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
 async function composeTextOverBackground(backgroundBuffer, prod) {
   if (!_sharp) return backgroundBuffer;
 
-const planName = (!prod.plan || /^(unknown|null|n\/a|na|none|-|\s*)$/i.test(String(prod.plan)))
-  ? ''
-  : String(prod.plan);
+  // 1) Inspect background dimensions
+  let base = _sharp(backgroundBuffer);
+  let meta = await base.metadata().catch(() => ({}));
+  let W = Math.max(1, meta.width  || 1024);
+  let H = Math.max(1, meta.height || 1024);
 
+  // if metadata was missing, force decode once so width/height get populated
+  if (!meta.width || !meta.height) {
+    const tmp = await base.png().toBuffer();
+    base = _sharp(tmp);
+    meta = await base.metadata();
+    W = Math.max(1, meta.width  || 1024);
+    H = Math.max(1, meta.height || 1024);
+  }
 
-  function wrapText(text, maxWidth, maxLines) {
+  // 2) Text to show
+  const titleRaw = String(prod?.name || 'Product').trim();
+  const planText = (!prod?.plan || /^(unknown|null|n\/a|na|none|-|\s*)$/i.test(String(prod.plan))) ? '' : String(prod.plan);
+
+  // 3) Scale typography by canvas size
+  const scale = Math.min(W, H) / 1024;
+  const clamp  = (n, min, max) => Math.max(min, Math.min(max, n));
+  let titleFont = clamp(Math.round(120 * scale), 28, 180);
+  const planFont = clamp(Math.round(58  * scale), 18, 120);
+
+  // wrap helper (by characters, scaled a bit by width)
+  function wrapByChars(text, maxCharsPerLine) {
     const words = String(text||'').trim().split(/\s+/);
     const lines = [];
     let cur = '';
     for (const w of words) {
-      if ((cur ? cur + ' ' : '') .length + w.length <= maxWidth) cur = (cur ? cur + ' ' : '') + w;
-      else { lines.push(cur); cur = w; if (lines.length >= maxLines-1) break; }
+      const cand = cur ? `${cur} ${w}` : w;
+      if (cand.length <= maxCharsPerLine) cur = cand;
+      else { if (cur) lines.push(cur); cur = w; }
+      if (lines.length >= 2) break; // 2 lines max
     }
-    if (cur) lines.push(cur);
-    return lines.slice(0, maxLines);
+    if (cur && lines.length < 2) lines.push(cur);
+    return lines;
   }
 
-const titleLines = wrapText(prod.name, 18, 2);
-  const titleSize  = titleLines.length > 1 ? 100 : 120;
-  const titleTspans = titleLines.map((line,i)=>`<tspan x="512" dy="${i===0?0:'1.2em'}">${escXML(line)}</tspan>`).join('');
+  // wider canvases can fit more chars per line
+  const maxChars = Math.max(12, Math.round(18 * (W / 1024)));
+  let titleLines = wrapByChars(titleRaw, maxChars);
+  // nudge down font if text still too long
+  while (titleLines.join(' ').length > maxChars * 2 && titleFont > 28) {
+    titleFont -= 2;
+    titleLines = wrapByChars(titleRaw, maxChars);
+  }
+  titleLines = titleLines.slice(0, 2);
 
-  const textSvg = `
-  <svg width="1024" height="512" viewBox="0 0 1024 512" xmlns="http://www.w3.org/2000/svg">
-    <text x="512" y="256" text-anchor="middle"
-          font-family="DejaVu Sans, Noto Sans, Liberation Sans, Arial, Helvetica, sans-serif"
-          font-size="${titleSize}" font-weight="700" fill="#FFFFFF">${titleTspans}</text>
-    ${planName ? `<text x="512" y="400" text-anchor="middle"
-          font-family="DejaVu Sans, Noto Sans, Liberation Sans, Arial, Helvetica, sans-serif"
-          font-size="60" font-weight="500" fill="#E5E7EB">${escXML(planName)}</text>` : ''}
-  </svg>`.trim();
+  const lhTitle = 1.15;
+  const titleBlockHeight = Math.round(titleFont * (titleLines.length + (titleLines.length - 1) * (lhTitle - 1)));
 
-  const textBuffer = await _sharp(Buffer.from(textSvg)).png().toBuffer();
+  // 4) Vertical layout
+  const titleY = Math.round(H * 0.50) - Math.round(titleBlockHeight * 0.25);
+  const minGapPx = Math.max(Math.round(titleFont * 0.22), Math.round(28 * scale));
+  const lastTitleBaseline = titleY + Math.round((titleLines.length - 1) * (titleFont * lhTitle));
+  const planY = planText ? (lastTitleBaseline + Math.round(titleFont * 0.9) + minGapPx) : null;
 
-  return _sharp(backgroundBuffer)
-    .composite([
-      { input: Buffer.from('<svg width="1024" height="1024"><rect width="1024" height="1024" fill="black" opacity="0.40"/></svg>'), blend: 'multiply' },
-      { input: textBuffer, gravity: 'center' },
-    ])
+  // 5) Build overlay SVG at EXACT WxH
+  const titleTspans = titleLines.map((line, i) =>
+    i === 0
+      ? `<tspan x="${W/2}" y="${titleY}">${escXML(line)}</tspan>`
+      : `<tspan x="${W/2}" dy="${Math.round(titleFont * lhTitle)}">${escXML(line)}</tspan>`
+  ).join('');
+
+  const overlaySvg = `
+<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">
+  <rect width="100%" height="100%" fill="black" opacity="0.35"/>
+  <text text-anchor="middle"
+        font-family="DejaVu Sans, Noto Sans, Liberation Sans, Arial, Helvetica, sans-serif"
+        font-size="${titleFont}" font-weight="800" fill="#FFFFFF">
+    ${titleTspans}
+  </text>
+  ${planText ? `
+  <text x="${W/2}" y="${planY}" text-anchor="middle"
+        font-family="DejaVu Sans, Noto Sans, Liberation Sans, Arial, Helvetica, sans-serif"
+        font-size="${planFont}" font-weight="600" fill="#E5E7EB">
+    ${escXML(planText)}
+  </text>` : ''}
+</svg>`.trim();
+
+  const overlayBuf = await _sharp(Buffer.from(overlaySvg)).png().toBuffer();
+
+  // 6) Composite — overlay is guaranteed <= base now
+  return base
+    .composite([{ input: overlayBuf, left: 0, top: 0 }])
     .png()
     .toBuffer();
 }
 
 
-/* ---- 1) Pollinations (hosted, free) ---- */
+/* ---- providers ---- */
 async function generateImageFromPollinations(prompt) {
   try {
     const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}`;
@@ -514,7 +609,6 @@ async function generateImageFromPollinations(prompt) {
   }
 }
 
-/* ---- 2) Hugging Face (existing) ---- */
 async function generateImageFromHuggingFace(prompt) {
   if (!HF_KEY) { console.warn('[img] HF key missing'); return null; }
   try {
@@ -538,7 +632,6 @@ async function generateImageFromHuggingFace(prompt) {
   }
 }
 
-/* ---- 3) DeepAI (hosted fallback) ---- */
 async function generateImageFromDeepAI(prompt) {
   if (!DEEPAI_KEY) { console.warn('[img] DeepAI key missing'); return null; }
   try {
@@ -561,7 +654,86 @@ async function generateImageFromDeepAI(prompt) {
   }
 }
 
-/* ---- helpers for brand OG/logo/search before AI ---- */
+async function generateImageFromCloudflare(
+  prompt,
+  {
+    model = '@cf/black-forest-labs/flux-1-schnell',
+    width = 768,
+    height = 768,
+    steps = 4,
+    guidance = 3.5,
+    //negative_prompt = 'nsfw, nude, nudity, cleavage, erotic, sexual, suggestive, bikini, lingerie, skin, body, people, face, human, watermark, text, logo, hands, portrait, character, anime, cartoon, doll, ugly, deformed'
+  } = {}
+) {
+  if (!CF_ACCOUNT_ID || !CF_API_TOKEN) {
+    console.warn('[img] Cloudflare creds missing');
+    return null;
+  }
+
+  // 1) Guard model slug
+  if (!/^@cf\//.test(model)) model = '@cf/black-forest-labs/flux-1-schnell';
+
+  // 2) Force SFW, abstract background (reduce safety triggers)
+  const safePrompt = [
+    String(prompt || '')
+      .replace(/\banime|animation|character\b/gi, 'abstract motion graphics')
+      .replace(/\b(sexy|nsfw|nude|nudity)\b/gi, 'sfw')
+      .trim(),
+    'abstract geometric product background, shapes only, no people, no faces, no bodies, no text, SFW, corporate, clean'
+  ].join('. ');
+
+  // 3) Coerce dimensions
+  const W = Math.max(256, parseInt(width, 10) || 768);
+  const H = Math.max(256, parseInt(height, 10) || 768);
+
+  const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${encodeURIComponent(model)}`;
+  console.log('[img] Cloudflare URL:', url);
+
+  const body = { prompt: safePrompt, negative_prompt, width: W, height: H, num_steps: steps, guidance };
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${CF_API_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(60000) : undefined
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    if (/NSFW|safety|adult/i.test(txt)) {
+      console.warn('[img] Cloudflare blocked prompt (NSFW); falling back.');
+      return null;
+    }
+    if (res.status === 429 || /rate|quota|limit/i.test(txt)) {
+      console.warn('[img] Cloudflare rate/quota; falling back.');
+      return null;
+    }
+    throw new Error(`Cloudflare AI HTTP ${res.status}: ${txt.slice(0, 200)}`);
+  }
+
+  const ct = res.headers.get('content-type') || '';
+  if (ct.startsWith('image/')) {
+    // Direct image bytes response
+    return Buffer.from(await res.arrayBuffer());
+  }
+
+  // 4) Be generous about response shapes
+  let data = null;
+  try { data = await res.json(); } catch { /* ignore */ }
+
+  const result = data?.result ?? data ?? {};
+  const b64 =
+    result.image ||
+    result.images?.[0] ||
+    result.output?.[0] ||
+    data?.image;
+
+  if (!b64) return null;
+  return Buffer.from(b64, 'base64');
+}
+
+
+/* ---- brand/og/search helpers ---- */
 async function getOG(url) {
   try {
     const res = await fetch(url, { signal: typeof AbortSignal?.timeout==='function' ? AbortSignal.timeout(8000) : undefined });
@@ -602,7 +774,6 @@ async function findBestImageWithSearch(query) {
   } catch (e) { console.warn('[img] image search failed:', e.message); return null; }
 }
 
-/* ---- non-AI image attempts (OG/logo/search). returns URL or null ---- */
 async function tryBrandImages(prod, table) {
   const domain = resolveBrandDomain(prod.name);
   if (domain) {
@@ -632,7 +803,7 @@ async function tryBrandImages(prod, table) {
         }
       }
     } catch (e) {
-      console.warn(`[img] Brandfetch failed: ${e.message}`);
+      console.warn('[img] Brandfetch failed:', e.message);
     }
   }
 
@@ -646,7 +817,7 @@ async function tryBrandImages(prod, table) {
   return null;
 }
 
-// DuckDuckGo HTML
+/* ---- DuckDuckGo + Wikipedia helpers ---- */
 async function ddgSearchHTML(query, max = 8) {
   const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}&ia=web`;
   try {
@@ -662,8 +833,6 @@ async function ddgSearchHTML(query, max = 8) {
     return Array.from(new Set(links)).slice(0, max);
   } catch { return []; }
 }
-
-// DuckDuckGo LITE (fallback)
 async function ddgSearchLite(query, max = 8) {
   const url = `https://duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
   try {
@@ -679,42 +848,21 @@ async function ddgSearchLite(query, max = 8) {
     return Array.from(new Set(links)).slice(0, max);
   } catch { return []; }
 }
-
-// Wikipedia opensearch (no key)
-async function wikiSearch(phrase) {
-  try {
-    const url = `https://en.wikipedia.org/w/api.php?action=opensearch&search=${encodeURIComponent(phrase)}&limit=1&namespace=0&format=json`;
-    const res = await fetch(url, { signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(12000) : undefined });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const link = data?.[3]?.[0];
-    return link || null;
-  } catch { return null; }
-}
-
-// --- Wikipedia deep search (no key) ---
 async function wikiBestPage(query) {
   try {
-    // broader search to get best matching title
     const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=5&format=json`;
-    const res = await fetch(url, {
-      signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(12000) : undefined,
-    });
+    const res = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0' }, signal: typeof AbortSignal?.timeout==='function' ? AbortSignal.timeout(12000) : undefined });
     if (!res.ok) return null;
     const data = await res.json();
     const hits = data?.query?.search || [];
-    // prefer exact-ish / top-scoring
     const best = hits[0];
     return best?.title || null;
   } catch { return null; }
 }
-
 async function wikiExtractByTitle(title) {
   try {
     const url = `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=1&redirects=1&format=json&titles=${encodeURIComponent(title)}`;
-    const res = await fetch(url, {
-      signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(12000) : undefined,
-    });
+    const res = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0' }, signal: typeof AbortSignal?.timeout==='function' ? AbortSignal.timeout(12000) : undefined });
     if (!res.ok) return '';
     const data = await res.json();
     const pages = data?.query?.pages || {};
@@ -723,27 +871,18 @@ async function wikiExtractByTitle(title) {
     return text ? text.slice(0, 12000) : '';
   } catch { return ''; }
 }
-
-
-// Use both DDG modes + wikipedia; fetch many pages; try common product paths
 async function searchWebForProduct(productName, plan) {
   const q = [productName, plan, 'price features premium plan'].filter(Boolean).join(' ');
   const urls = new Set();
+  (await ddgSearchHTML(q, 8)).forEach(u => urls.add(u));
+  (await ddgSearchLite(q, 8)).forEach(u => urls.add(u));
 
-  // DDG html + lite (reuse your ddgSearchHTML / ddgSearchLite functions)
-  if (typeof ddgSearchHTML === 'function') (await ddgSearchHTML(q, 8)).forEach(u => urls.add(u));
-  if (typeof ddgSearchLite === 'function') (await ddgSearchLite(q, 8)).forEach(u => urls.add(u));
-
-  // pick likely official host from found URLs (levenshtein helpers already present)
-  const hosts = Array.from(urls).map(u => {
-    try { return new URL(u).hostname.replace(/^www\./,''); } catch { return null; }
-  }).filter(Boolean);
-
+  const hosts = Array.from(urls).map(u => { try { return new URL(u).hostname.replace(/^www\./,''); } catch { return null; } }).filter(Boolean);
   const brand = String(productName||'').toLowerCase().replace(/[^a-z0-9]+/g,'');
   let bestHost = null, bestScore = Infinity;
   for (const h of hosts) {
     const base = (h.split('.').slice(0,-1).join('.') || h).toLowerCase().replace(/[^a-z0-9]+/g,'');
-    const d = typeof levenshtein === 'function' ? levenshtein(brand, base) : 999;
+    const d = levenshtein(brand, base);
     if (d < bestScore) { bestScore = d; bestHost = h; }
   }
   if (bestHost && bestScore <= 3) {
@@ -752,7 +891,6 @@ async function searchWebForProduct(productName, plan) {
       .map(p => base.replace(/\/$/,'') + p).forEach(u => urls.add(u));
   }
 
-  // Fetch many pages (direct or via r.jina.ai inside fetchWebsiteRaw)
   const chunks = [];
   let count = 0;
   for (const u of urls) {
@@ -766,10 +904,8 @@ async function searchWebForProduct(productName, plan) {
     } catch {}
   }
 
-  // Bundle so far
   let bundle = chunks.join('\n\n').slice(0, 20000);
 
-  // 🛟 Deep Wikipedia fallback when evidence is weak
   if (bundle.length < 800) {
     const title = await wikiBestPage(productName);
     if (title) {
@@ -780,14 +916,12 @@ async function searchWebForProduct(productName, plan) {
     }
   }
 
-  // Final log & return
   const pageCount = (bundle.match(/SOURCE:/g) || []).length;
   console.log(`[text] evidence: ${bundle.length} chars from ${pageCount} pages; official=${bestHost || '-'}`);
   return bundle;
 }
 
-
-// ---------- Pollinations Text (OpenAI-compatible, no key) ----------
+// Pollinations Text
 async function pollinationsTextJSON(systemPrompt, userPrompt, model = 'searchgpt') {
   try {
     const res = await fetch('https://text.pollinations.ai/openai/v1/chat/completions', {
@@ -814,12 +948,8 @@ async function pollinationsTextJSON(systemPrompt, userPrompt, model = 'searchgpt
   }
 }
 
-
-
-// ---------- Gemini rotation (optional; check ToS) ----------
-// ---------- Gemini rotation (better logging + JSON mode) ----------
+// Gemini rotation
 let _geminiIndex = 0;
-
 async function geminiTextJSON(systemPrompt, userPrompt) {
   if (!GEMINI_KEYS.length) {
     console.warn('[text] Gemini skipped: no GEMINI_API_KEYS set');
@@ -851,20 +981,16 @@ async function geminiTextJSON(systemPrompt, userPrompt) {
       );
 
       if (!res.ok) {
-        const msg = await res.text().catch(()=>'');
+        const msg = await res.text().catch(()=>'' );
         console.warn(`[text] Gemini HTTP ${res.status} — ${msg.slice(0, 300)}`);
-        if (res.status === 429) continue; // try next key
+        if (res.status === 429) continue;
         continue;
       }
 
       const data = await res.json();
       const parts = data?.candidates?.[0]?.content?.parts || [];
       const text = parts.map(p => p.text).filter(Boolean).join('');
-      if (!text) {
-        const finish = data?.candidates?.[0]?.finishReason || 'unknown';
-        console.warn(`[text] Gemini empty content (finishReason=${finish})`);
-        continue;
-      }
+      if (!text) continue;
 
       try {
         const cleaned = text.replace(/```(?:json)?\s*([\s\S]*?)\s*```/gi, '$1').trim();
@@ -880,20 +1006,16 @@ async function geminiTextJSON(systemPrompt, userPrompt) {
   return null;
 }
 
-
 function buildImagePrompt(prod) {
   const name = prod?.name || 'Unnamed Product';
   const plan = prod?.plan || '';
   return `Cinematic, professional product background for "${name}" ${plan}, 4K, modern, clean, vibrant, soft lighting, high detail`;
 }
 
-
-// === Local dynamic card (no external APIs) ===
 async function createInitialImage(prod) {
   const title = shortBrandName(prod);
   const plan = prod.plan || '';
 
-  // Background SVG with gradient + soft blobs
   const bgSvg = `
   <svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
     <defs>
@@ -916,62 +1038,111 @@ async function createInitialImage(prod) {
     <circle cx="880" cy="760" r="360" fill="url(#b2)"/>
   </svg>`;
 
-  // Title/plan overlay SVG
-const esc = (s='') => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-function wrap(text, maxWidth, maxLines) {
-  const words = String(text).trim().split(/\s+/);
-  const lines = []; let cur = '';
-  for (const w of words) {
-    if ((cur + ' ' + w).trim().length <= maxWidth) cur = (cur ? cur + ' ' : '') + w;
-    else { lines.push(cur); cur = w; if (lines.length >= maxLines-1) break; }
+  function splitNameAndPlan(name = '', plan = '') {
+    const n = String(name || '').trim();
+    const p = String(plan || '').trim();
+    if (p) return { productName: n, planText: p };
+    const PLAN_WORDS = ['plan','pro','plus','premium','basic','standard','advanced','creator','business','enterprise','personal','family','student','team','annual','year','yr','monthly','month','mo','lifetime'];
+    const rx = new RegExp(String.raw`(?:^|\s)((?:\d+\s*(?:year|yr|month|mo)\b.*)|(?:${PLAN_WORDS.join('|')})\b.*)$`, 'i');
+    const m = n.match(rx);
+    if (!m) return { productName: n, planText: '' };
+    const cut = m.index ?? -1;
+    if (cut <= 0) return { productName: n, planText: '' };
+    const namePart = n.slice(0, cut).trim().replace(/[–—\-:]+$/, '').trim();
+    const planPart = n.slice(cut).trim();
+    return { productName: namePart || n, planText: planPart };
   }
-  if (cur) lines.push(cur);
-  return lines.slice(0, maxLines);
-}
-const titleLines = wrap(title, 18, 2);
-const titleSize = titleLines.length > 1 ? 100 : 120;
-const tspans = titleLines.map((line,i)=>`<tspan x="512" dy="${i===0?0:'1.2em'}">${esc(line)}</tspan>`).join('');
-const overlaySvg = `
-<svg width="1024" height="512" viewBox="0 0 1024 512" xmlns="http://www.w3.org/2000/svg">
-  <text x="512" y="256" text-anchor="middle"
-        font-family="Arial, Helvetica, DejaVu Sans, sans-serif"
-        font-size="${titleSize}" font-weight="700" fill="#FFFFFF">${tspans}</text>
-  ${plan ? `<text x="512" y="400" text-anchor="middle"
-        font-family="Arial, Helvetica, DejaVu Sans, sans-serif"
-        font-size="60" font-weight="500" fill="#E5E7EB">${esc(plan)}</text>` : ''}
-</svg>`;
-
-
-  // If sharp is missing, return a single-layer SVG fallback buffer
-  if (!_sharp) {
-    // merge background + dark overlay + title by simple stacking (best-effort)
-    // Telegram/Supabase will accept this as binary content
-    return Buffer.from(bgSvg);
+  function wrapByChars(text, maxCharsPerLine, maxLines = 2) {
+    const words = String(text || '').trim().split(/\s+/);
+    const lines = [];
+    let cur = '';
+    for (const w of words) {
+      const cand = cur ? cur + ' ' + w : w;
+      if (cand.length <= maxCharsPerLine) cur = cand;
+      else { if (cur) lines.push(cur); cur = w; }
+      if (lines.length >= maxLines) break;
+    }
+    if (cur && lines.length < maxLines) lines.push(cur);
+    return lines.slice(0, maxLines);
   }
 
+  const esc = (s='') => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  const canvasW = 1024, canvasH = 1024;
+
+  const split = splitNameAndPlan(prod?.name, prod?.plan);
+  const productName = split.productName || 'Product';
+  const planTextRaw  = split.planText || prod?.plan || '';
+
+  const planText = planTextRaw && !/^(unknown|null|n\/a|na|none|-|\s*)$/i.test(planTextRaw) ? planTextRaw : '';
+  const validityText = prod?.validity && !/^(unknown|null|n\/a|na|none|-|\s*)$/i.test(String(prod.validity))
+    ? `Validity: ${prod.validity}` : '';
+  const priceText = Number.isFinite(prod?.price) ? `Price: ₹${Number(prod.price).toLocaleString('en-IN')}` : '';
+
+  let titleFont = 120;
+  let titleLines = wrapByChars(productName, 18, 2);
+  if (titleLines.join(' ').length > 18*2) { titleFont = 110; titleLines = wrapByChars(productName, 17, 2); }
+  if (titleLines.join(' ').length > 17*2) { titleFont = 100; titleLines = wrapByChars(productName, 16, 2); }
+  if (titleLines.join(' ').length > 16*2) { titleFont = 92;  titleLines = wrapByChars(productName, 15, 2); }
+  if (titleLines.join(' ').length > 15*2) { titleFont = 84;  titleLines = wrapByChars(productName, 14, 2); }
+
+  const lhTitle = 1.15;
+  const titleBlockHeight = titleFont * (titleLines.length + (titleLines.length - 1) * (lhTitle - 1));
+
+  let y = Math.round(canvasH * 0.46) - Math.round(titleBlockHeight * 0.25);
+
+  const gapSm = Math.max(24, Math.round(titleFont * 0.18));
+  const gapMd = Math.max(32, Math.round(titleFont * 0.28));
+
+  const titleTspans = titleLines.map((line, i) =>
+    i === 0
+      ? `<tspan x="${canvasW/2}" y="${y}">${esc(line)}</tspan>`
+      : `<tspan x="${canvasW/2}" dy="${titleFont * lhTitle}">${esc(line)}</tspan>`
+  ).join('');
+
+  y += (titleLines.length - 1) * (titleFont * lhTitle) + Math.round(titleFont * 0.2) + gapMd;
+
+  const detailFont = 58;
+  const lhDetail = 1.2;
+  const details = [planText, validityText, priceText].filter(Boolean);
+
+  let detailNodes = '';
+  details.forEach((line) => {
+    y = Math.min(y, canvasH - 64);
+    detailNodes += `<text x="${canvasW/2}" y="${y}" text-anchor="middle"
+      font-family="Arial, Helvetica, DejaVu Sans, sans-serif"
+      font-size="${detailFont}" font-weight="600" fill="#E5E7EB">${esc(line)}</text>`;
+    y += Math.round(detailFont * lhDetail) + gapSm;
+  });
+
+  const overlaySvg = `
+<svg width="${canvasW}" height="${canvasH}" viewBox="0 0 ${canvasW} ${canvasH}" xmlns="http://www.w3.org/2000/svg">
+  <rect width="100%" height="100%" fill="black" opacity="0.35"/>
+  <text text-anchor="middle"
+        font-family="Arial, Helvetica, DejaVu Sans, sans-serif"
+        font-size="${titleFont}" font-weight="800" fill="#FFFFFF">
+    ${titleTspans}
+  </text>
+  ${detailNodes}
+</svg>`.trim();
+
+  if (!_sharp) return Buffer.from(bgSvg);
   const bgBuf = await _sharp(Buffer.from(bgSvg)).png().toBuffer();
   const overlayBuf = await _sharp(Buffer.from(overlaySvg)).png().toBuffer();
 
   const composed = await _sharp(bgBuf)
-    .composite([
-      { input: Buffer.from('<svg width="1024" height="1024"><rect width="1024" height="1024" fill="black" opacity="0.35"/></svg>'), blend: 'over' },
-      { input: overlayBuf, gravity: 'center' },
-    ])
+    .composite([{ input: overlayBuf, gravity: 'center' }])
     .png()
     .toBuffer();
 
   return composed;
 }
 
-
-/* ---- build prompt used by all generators ---- */
 function buildBackgroundPrompt(prod) {
   const theme = `${shortBrandName(prod)}, ${prod.description || prod.category || ''}`.trim();
   return `cinematic, professional product background, abstract, vibrant gradient, soft lighting, modern, clean, themed around "${theme}". 4k, masterpiece.`;
 }
 
-/* ---- interactive API selection keyboard ---- */
-// near other keyboards
+/* ---- keyboards ---- */
 const kbTextAPIs = Markup.inlineKeyboard([
   [Markup.button.callback('🦙 Pollinations (SearchGPT)', 'txtapi_pollinations')],
   [Markup.button.callback('🟪 Groq (Llama3-70B)', 'txtapi_groq')],
@@ -990,79 +1161,12 @@ const kbImageAPIs = Markup.inlineKeyboard([
   [Markup.button.callback('🖼️ Pollinations (Free)', 'imgapi_pollinations')],
   [Markup.button.callback('🤗 Hugging Face', 'imgapi_hf')],
   [Markup.button.callback('🟦 DeepAI', 'imgapi_deepai')],
+  [Markup.button.callback('🟧 Cloudflare Workers AI', 'imgapi_cloudflare')],
   [Markup.button.callback('🟣 Local Card (No API)', 'imgapi_local')],
   [Markup.button.callback('🤖 Auto (best effort)', 'imgapi_auto')],
   [Markup.button.callback('❌ Cancel', 'imgapi_cancel')],
 ]);
 
-
-
-
-/* ---- run generation with ordered providers, return hosted URL ---- */
-async function generateBackgroundWithOrder(prod, table, order = []) {
-  const prompt = buildImagePrompt(prod);
-  console.log('[img] Using image prompt:', prompt);
-
-  for (const provider of order) {
-    let buf = null;
-
-    if (provider === 'pollinations') {
-      buf = await tryWithRetries('image:pollinations', () => generateImageFromPollinations(prompt), IMAGE_RETRIES);
-      if (buf && buf.length) {
-        const composed = IMAGE_TEXT_OVERLAY ? await composeTextOverBackground(buf, prod) : buf;
-        try { return await rehostToSupabase(composed, `${prod.name}_ai.png`, table); }
-        catch (e) { console.warn('[img] rehost after pollinations failed:', e.message); }
-      }
-      continue;
-    }
-
-    if (provider === 'hf') {
-      // HF is our creative fallback – always add text overlay
-      buf = await tryWithRetries('image:hf', () => generateImageFromHuggingFace(prompt), IMAGE_RETRIES);
-      if (buf && buf.length) {
-        const composed = await composeTextOverBackground(buf, prod);
-        try { return await rehostToSupabase(composed, `${prod.name}_ai.png`, table); }
-        catch (e) { console.warn('[img] rehost after hf failed:', e.message); }
-      }
-      continue;
-    }
-
-    if (provider === 'deepai') {
-      buf = await tryWithRetries('image:deepai', () => generateImageFromDeepAI(prompt), IMAGE_RETRIES);
-      if (buf && buf.length) {
-        const composed = IMAGE_TEXT_OVERLAY ? await composeTextOverBackground(buf, prod) : buf;
-        try { return await rehostToSupabase(composed, `${prod.name}_ai.png`, table); }
-        catch (e) { console.warn('[img] rehost after deepai failed:', e.message); }
-      }
-      continue;
-    }
-
-    if (provider === 'local') {
-      // Ultimate safety net – local dynamic card (already includes title/plan)
-      try {
-        const localBuf = await createInitialImage(prod);
-        return await rehostToSupabase(localBuf, `${prod.name}_local.png`, table);
-      } catch (e) {
-        console.warn('[img] local createInitialImage failed:', e.message);
-      }
-      continue;
-    }
-  }
-
-  // Final safety: gradient (+ overlay) and return it
-  try {
-    const base = gradientBackgroundSVG();
-    const finalBuf = IMAGE_TEXT_OVERLAY ? await composeTextOverBackground(base, prod) : base;
-    return await rehostToSupabase(finalBuf, `${prod.name}_fallback.png`, table);
-  } catch (e) {
-    console.warn('[img] gradient fallback failed:', e.message);
-    return null;
-  }
-}
-
-
-
-/* --------------------- keyboards / messages & Rest --------------------- */
 const kbConfirm = Markup.inlineKeyboard([
   [Markup.button.callback('✅ Looks Good & Save', 'save')],
   [Markup.button.callback('✏️ Edit Text', 'edit_text'), Markup.button.callback('🖼️ Change Image', 'change_image')],
@@ -1114,12 +1218,34 @@ function reviewMessage(prod, ai, table) {
 
 /* --------------------- bot wiring --------------------- */
 bot.use(session());
-bot.use(async (ctx, next) => { if (!isAdmin(ctx)) return; if (!ctx.session) ctx.session = {}; return next(); });
+bot.use(async (ctx, next) => {
+  if (!isAdmin(ctx)) return;                  // still keep your admin gate
+  if (!ctx.session) ctx.session = {};
+
+  // If paused, ignore everything EXCEPT resume actions or /start or any new message (per your request)
+  if (ctx.session.paused) {
+    const isResumeCb = ctx.update?.callback_query?.data === 'resume_bot';
+    const isStartCmd = !!ctx.message?.text?.startsWith('/start');
+    const isAnyMessage = !!ctx.message; // any message wakes it
+
+    if (!(isResumeCb || isStartCmd || isAnyMessage)) return; // stay paused & ignore
+    // wake up
+    ctx.session.paused = false;
+    try { if (ctx.answerCbQuery) await ctx.answerCbQuery('Resumed'); } catch {}
+    try { await ctx.reply('✅ Resumed.'); } catch {}
+  }
+
+  // every meaningful admin interaction resets the idle timer
+  startIdleTimer(ctx);
+
+  return next();
+});
 
 bot.start(async (ctx) => {
   if (!isAdmin(ctx)) return;
+   ctx.session.paused = false; // ensure awake
+  startIdleTimer(ctx);
   ctx.session = {};
-  // reset any lingering choices
   ctx.session.textOrder = null;
   ctx.session.await = null;
   await ctx.reply('Welcome! Please choose which table you want to work with:', kbChooseTable);
@@ -1172,7 +1298,6 @@ bot.action(/^set_table_(.+)$/, async (ctx) => {
   const tableName = ctx.match[1];
   ctx.session.table = tableName === 'products' ? TABLES.products : TABLES.exclusive;
 
-  // also reset model choice when switching tables
   ctx.session.textOrder = null;
   ctx.session.await = null;
 
@@ -1183,7 +1308,6 @@ bot.action(/^set_table_(.+)$/, async (ctx) => {
     { parse_mode: 'MarkdownV2' }
   );
 });
-
 
 bot.action('again_smartadd', async (ctx) => {
   if (!isAdmin(ctx)) return;
@@ -1203,6 +1327,17 @@ bot.action('again_done', async (ctx) => {
   await ctx.reply('Please choose a table to begin:', kbChooseTable);
 });
 
+bot.action('resume_bot', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  await ctx.answerCbQuery('Resuming…').catch(()=>{});
+  ctx.session.paused = false;
+  try { await ctx.editMessageText('✅ Resumed.'); } catch {}
+  startIdleTimer(ctx);
+  // Optional: nudge the flow
+  if (!ctx.session.table) await ctx.reply('Pick a table to continue:', kbChooseTable);
+});
+
+
 /* ----- edit / image change inline flow ----- */
 bot.action('edit_text', async (ctx) => {
   if (!ctx.session.review) return ctx.answerCbQuery();
@@ -1214,10 +1349,11 @@ bot.action('edit_text', async (ctx) => {
 bot.action('change_image', async (ctx) => {
   if (!ctx.session.review) return ctx.answerCbQuery();
   await ctx.answerCbQuery();
-  ctx.session.await = 'image_url';
+  ctx.session.await = 'choose_image_api';
   await ctx.deleteMessage().catch(()=>{});
-  await ctx.reply('Please send a new image URL or upload a photo for the product.');
+  await ctx.reply('Pick a generator, or send a new image URL / upload a photo:', kbImageAPIs);
 });
+
 
 bot.action(/^edit_field_(.+)$/, (ctx) => {
   if (!isAdmin(ctx) || !ctx.session.review) return ctx.answerCbQuery();
@@ -1235,12 +1371,10 @@ function setTextOrder(ctx, order) {
   ctx.deleteMessage().catch(()=>{});
 
   if (ctx.session.pendingSmart) {
-    // Finish the whole smart-add flow now that a model is chosen
     return resumeSmartAddAfterTextChoice(ctx);
   }
   return ctx.reply('✅ Text provider set.');
 }
-
 
 bot.action('txtapi_pollinations', (ctx)=>setTextOrder(ctx, ['pollinations','groq','gemini']));
 bot.action('txtapi_groq',         (ctx)=>setTextOrder(ctx, ['groq','pollinations','gemini']));
@@ -1252,16 +1386,12 @@ bot.action('txtapi_cancel', async (ctx)=>{
   ctx.session.await = null; ctx.session.pendingText = null;
 });
 
-
 /* ---------------- smart add ---------------- */
-// runEnrichment
 async function runEnrichment(ctx, text, websiteContent) {
   const aiData = await enrichWithAI(text, websiteContent, ctx.session.textOrder);
   console.log(`[text] filled — name="${aiData.name}" plan="${aiData.plan}" descChars=${(aiData.description||'').length} feats=${aiData.features?.length||0}`);
   return aiData;
 }
-
-
 
 const smartAddHandler = async (ctx) => {
   if (!ctx.session.table) { await ctx.reply('Please choose a table first.', kbChooseTable); return; }
@@ -1273,11 +1403,24 @@ const smartAddHandler = async (ctx) => {
     const urlMatch = Array.from(text.matchAll(URL_RX)).map(m => m[0])[0] || null;
     const guessedName = text.split('\n')[0].trim();
 
-    // 1) user URL > 2) brand slug > 3) search-based official domain (typo fixer)
     let domain = urlMatch || resolveBrandDomain(guessedName);
-    if (!urlMatch && !domain && typeof pickOfficialDomainFromSearch === 'function') {
+    if (!urlMatch && !domain) {
       try {
-        const bestHost = await pickOfficialDomainFromSearch(guessedName);
+        const bestHost = await (async function pickOfficialDomainFromSearch(brandName){
+          const urls = new Set();
+          try { (await ddgSearchHTML(brandName, 10)).forEach(u=>urls.add(u)); } catch {}
+          try { (await ddgSearchLite(brandName, 10)).forEach(u=>urls.add(u)); } catch {}
+          const hosts = Array.from(urls).map(hostOf).filter(Boolean);
+          if (!hosts.length) return null;
+          const brand = String(brandName||'').toLowerCase().replace(/[^a-z0-9]+/g,'');
+          let best=null,bestScore=Infinity;
+          for (const h of hosts) {
+            const base = stripTLD(h).toLowerCase().replace(/[^a-z0-9]+/g,'');
+            const d = levenshtein(brand, base);
+            if (d < bestScore) { bestScore = d; best = h; }
+          }
+          return bestScore <= 3 ? best : null;
+        })(guessedName);
         if (bestHost) domain = `https://${bestHost}`;
       } catch {}
     }
@@ -1301,25 +1444,21 @@ const smartAddHandler = async (ctx) => {
       await ctx.reply('🔎 Couldn’t auto-detect the official site. I’ll rely on web search evidence.');
     }
 
-    // TEXT MODEL CHOICE (once per session or per product)
     if (!ctx.session.textOrder) {
       console.log('[text] no textOrder; asking user to choose text model');
       ctx.session.await = 'choose_text_api';
-      ctx.session.pendingSmart = { text, websiteContent, ogImageFromPage }; // keep OG image too
+      ctx.session.pendingSmart = { text, websiteContent, ogImageFromPage };
       await ctx.reply('Choose which **text model** to fill product details (I’ll retry and fallback automatically):', kbTextAPIs);
       return;
     }
     console.log('[text] using textOrder =', ctx.session.textOrder);
 
-    // AI parse with chosen order
     const aiData = await runEnrichment(ctx, text, websiteContent);
 
-    // Prepare product with parsed text (no image yet)
     const prod = { ...aiData, image: null };
     ctx.session.review = { prod, ai: aiData, table: ctx.session.table, ogImageFromPage };
     ctx.session.mode = null;
 
-    // Show text-only review and let user edit OR generate image
     const msg = [
       '📝 *Parsed (Review & Edit)*',
       `*Name:* ${escapeMd(aiData.name)}`,
@@ -1332,14 +1471,13 @@ const smartAddHandler = async (ctx) => {
     ].join('\n');
 
     await replyMD(ctx, msg, kbBeforeImage);
-    return; // ⛔️ do NOT start image generation here
+    return;
   } catch (e) {
     console.error('Smart add flow failed:', e);
     await ctx.reply(`❌ An error occurred: ${e.message}. Please try again.`);
     ctx.session = { table: ctx.session.table };
   }
-}; 
-
+};
 
 async function resumeSmartAddAfterTextChoice(ctx) {
   const pending = ctx.session.pendingSmart;
@@ -1348,43 +1486,63 @@ async function resumeSmartAddAfterTextChoice(ctx) {
   ctx.session.pendingSmart = null;
   const { text, websiteContent, ogImageFromPage } = pending;
 
+  const aiData = await runEnrichment(ctx, text, websiteContent);
+  const prod = { ...aiData, image: null };
+  ctx.session.review = { prod, ai: aiData, table: ctx.session.table, ogImageFromPage };
+  ctx.session.mode = null;
 
-const aiData = await runEnrichment(ctx, text, websiteContent);
+  const msg = [
+    '📝 *Parsed (Review & Edit)*',
+    `*Name:* ${escapeMd(aiData.name)}`,
+    `*Plan:* ${escapeMd(aiData.plan)}`,
+    `*Validity:* ${escapeMd(aiData.validity)}`,
+    `*Price:* ${escapeMd(aiData.price ?? '-')}`,
+    `*Category:* ${escapeMd(aiData.category)}`,
+    '',
+    'Tap *Generate Image* when the text looks good.',
+  ].join('\n');
 
-// Prepare product with parsed text (no image yet)
-const prod = { ...aiData, image: null };
-ctx.session.review = { prod, ai: aiData, table: ctx.session.table, ogImageFromPage };
-ctx.session.mode = null;
-
-// Show text-only review and let user edit OR generate image
-const msg = [
-  '📝 *Parsed (Review & Edit)*',
-  `*Name:* ${escapeMd(aiData.name)}`,
-  `*Plan:* ${escapeMd(aiData.plan)}`,
-  `*Validity:* ${escapeMd(aiData.validity)}`,
-  `*Price:* ${escapeMd(aiData.price ?? '-')}`,
-  `*Category:* ${escapeMd(aiData.category)}`,
-  '',
-  'Tap *Generate Image* when the text looks good.',
-].join('\n');
-
-await replyMD(ctx, msg, kbBeforeImage);
-return; // ⛔️ do NOT start image generation here
-
+  await replyMD(ctx, msg, kbBeforeImage);
+  return;
 }
 
-
-/* ----- present review helper ----- */
+/* ----- present review helper (SAFE PREVIEW) ----- */
 async function presentReview(ctx) {
   if (!ctx.session.review) return;
   const { prod, ai, table } = ctx.session.review;
   const caption = reviewMessage(prod, ai, table);
-  await ctx.deleteMessage().catch(()=>{});
-  if (prod.image) {
-    return ctx.replyWithPhoto({ url: prod.image }, { caption, parse_mode: 'Markdown', ...kbConfirm });
-  } else {
-    return replyMD(ctx, caption, kbConfirm);
+
+  // rehost any Telegram file URLs before sending
+  let photoUrl = prod.image;
+  const needsRehost = photoUrl && /api\.telegram\.org\/file\/bot/i.test(photoUrl);
+  if (needsRehost) {
+    try {
+      photoUrl = await rehostToSupabase(
+        photoUrl,
+        `${sanitizeForFilename(prod.name || 'product')}.jpg`,
+        table
+      );
+      ctx.session.review.prod.image = photoUrl;
+    } catch (e) {
+      console.warn('[presentReview] rehost failed:', e.message);
+      photoUrl = null;
+    }
   }
+
+  await ctx.deleteMessage().catch(()=>{});
+
+  if (photoUrl) {
+    try {
+      return ctx.replyWithPhoto(
+        { url: photoUrl },
+        { caption, parse_mode: 'Markdown', ...kbConfirm }
+      );
+    } catch (e) {
+      console.warn('[presentReview] sendPhoto failed:', e.message);
+      return replyMD(ctx, caption + '\n_(image preview unavailable)_', kbConfirm);
+    }
+  }
+  return replyMD(ctx, caption, kbConfirm);
 }
 
 async function presentTextReview(ctx) {
@@ -1405,14 +1563,12 @@ async function presentTextReview(ctx) {
   return replyMD(ctx, msg, kbBeforeImage);
 }
 
-
 /* ----- inline edit apply ----- */
 async function applyInlineEdit(ctx) {
   if (!ctx.session.review || !ctx.session.await || !ctx.session.edit) return;
   const field = ctx.session.edit.field;
   let val = (ctx.message?.text || '').trim();
 
-  // tidy last two messages
   if (ctx.message?.message_id) {
     await ctx.deleteMessage(ctx.message.message_id - 1).catch(()=>{});
     await ctx.deleteMessage().catch(()=>{});
@@ -1427,8 +1583,7 @@ async function applyInlineEdit(ctx) {
   ctx.session.await = null;
   ctx.session.edit = null;
 
- await presentTextReview(ctx); // still in text stage
-
+  await presentTextReview(ctx);
 }
 
 /* ----- text handler ----- */
@@ -1436,21 +1591,13 @@ bot.on('text', async (ctx, next) => {
   if (!isAdmin(ctx)) return;
   const text = ctx.message?.text || '';
 
-   // 🛡 Prevent random text while waiting for text or image model selection
-  if (ctx.session.await === 'choose_text_api') {
-    // Waiting for the inline button selection for text model
-    return;
-  }
-  if (ctx.session.await === 'choose_image_api') {
-    // Waiting for the inline button selection for image API
-    return;
-  }
+  if (ctx.session.await === 'choose_text_api') return;
+  if (ctx.session.await === 'choose_image_api') return;
 
   if (!ctx.session.table && !text.startsWith('/')) {
     return ctx.reply('Welcome! To get started, please choose a table.', kbChooseTable);
   }
 
- 
   if (ctx.session.await === 'image_url' && text.startsWith('http')) {
     await ctx.reply('🔗 Got it. Rehosting your image URL...');
     try {
@@ -1497,23 +1644,19 @@ bot.action('confirm_generate_image', async (ctx) => {
 
   await ctx.reply('🎯 Confirmed. Looking for an official image first…');
 
-  // Try brand/OG first
   if (!prod.image) {
     const hosted = await tryBrandImages(prod, table);
-    if (hosted) prod.image = hosted;
+    if (hosted) {
+      prod.image = hosted;
+      return presentReview(ctx);
+    }
   }
 
-  if (prod.image) {
-    // Show final review with image & Save
-    const caption = reviewMessage(prod, ctx.session.review.ai, table);
-    return ctx.replyWithPhoto({ url: prod.image }, { caption, parse_mode: 'Markdown', ...kbConfirm });
-  } else {
-    // Ask which generator to use (your existing flow)
-    ctx.session.await = 'choose_image_api';
-    ctx.session.pendingImage = { table };
-    await ctx.reply('Choose which image API to use:', kbImageAPIs);
-  }
+  // 👉 nothing official found — let the user pick a generator
+  ctx.session.await = 'choose_image_api';
+  return ctx.reply('No official image found. Choose a generator or send a URL/upload:', kbImageAPIs);
 });
+
 
 bot.action('gen_image_now', async (ctx) => {
   if (!ctx.session.review) return ctx.answerCbQuery();
@@ -1523,42 +1666,94 @@ bot.action('gen_image_now', async (ctx) => {
 
   const { prod, table, ogImageFromPage } = ctx.session.review;
 
-  // 1) Try OG image from page (if any)
   if (ogImageFromPage && !prod.image) {
-    try {
-      prod.image = await rehostToSupabase(ogImageFromPage, `${prod.name}.jpg`, table);
-    } catch (e) {
-      console.warn('[img] OG rehost failed:', e.message);
-    }
+    try { prod.image = await rehostToSupabase(ogImageFromPage, `${prod.name}.jpg`, table); } catch {}
   }
-
-  // 2) Try brand/logo/search
   if (!prod.image) {
-    try {
-      const hosted = await tryBrandImages(prod, table);
-      if (hosted) prod.image = hosted;
-    } catch (e) {
-      console.warn('[img] tryBrandImages failed:', e.message);
-    }
+    try { const hosted = await tryBrandImages(prod, table); if (hosted) prod.image = hosted; } catch {}
   }
-
-  // 3) If still nothing, run your configured image providers
   if (!prod.image) {
-    const hosted = await generateBackgroundWithOrder(prod, table, ['pollinations','hf','deepai','local']); // or whatever order you prefer
+    const hosted = await generateBackgroundWithOrder(
+      prod, table, ['cloudflare','pollinations','hf','deepai','local']
+    );
     if (hosted) prod.image = hosted;
     else {
-      // last resort fallback
       const fb = await composeTextOverBackground(gradientBackgroundSVG(), prod);
       prod.image = await rehostToSupabase(fb, `${prod.name}_fallback.png`, table);
     }
   }
-
-  // Show the normal review with image + Save/Edit
   return presentReview(ctx);
 });
 
-
 /* -------- image API selection handlers -------- */
+async function generateBackgroundWithOrder(prod, table, order = []) {
+  const prompt = buildImagePrompt(prod);
+  console.log('[img] Using image prompt:', prompt);
+
+  for (const provider of order) {
+    let buf = null;
+
+    if (provider === 'pollinations') {
+      buf = await tryWithRetries('image:pollinations', () => generateImageFromPollinations(prompt), IMAGE_RETRIES);
+      if (buf && buf.length) {
+        const composed = IMAGE_TEXT_OVERLAY ? await composeTextOverBackground(buf, prod) : buf;
+        try { return await rehostToSupabase(composed, `${prod.name}_ai.png`, table); }
+        catch (e) { console.warn('[img] rehost after pollinations failed:', e.message); }
+      }
+      continue;
+    }
+
+    if (provider === 'hf') {
+      buf = await tryWithRetries('image:hf', () => generateImageFromHuggingFace(prompt), IMAGE_RETRIES);
+      if (buf && buf.length) {
+        const composed = await composeTextOverBackground(buf, prod);
+        try { return await rehostToSupabase(composed, `${prod.name}_ai.png`, table); }
+        catch (e) { console.warn('[img] rehost after hf failed:', e.message); }
+      }
+      continue;
+    }
+
+    if (provider === 'deepai') {
+      buf = await tryWithRetries('image:deepai', () => generateImageFromDeepAI(prompt), IMAGE_RETRIES);
+      if (buf && buf.length) {
+        const composed = IMAGE_TEXT_OVERLAY ? await composeTextOverBackground(buf, prod) : buf;
+        try { return await rehostToSupabase(composed, `${prod.name}_ai.png`, table); }
+        catch (e) { console.warn('[img] rehost after deepai failed:', e.message); }
+      }
+      continue;
+    }
+
+    if (provider === 'cloudflare') {
+  const buf = await tryWithRetries('image:cloudflare', () => generateImageFromCloudflare(prompt), IMAGE_RETRIES);
+  if (buf && buf.length) {
+    const composed = IMAGE_TEXT_OVERLAY ? await composeTextOverBackground(buf, prod) : buf;
+    try { return await rehostToSupabase(composed, `${prod.name}_cf.png`, table); }
+    catch (e) { console.warn('[img] rehost after cloudflare failed:', e.message); }
+  }
+  continue;
+}
+
+    if (provider === 'local') {
+      try {
+        const localBuf = await createInitialImage(prod);
+        return await rehostToSupabase(localBuf, `${prod.name}_local.png`, table);
+      } catch (e) {
+        console.warn('[img] local createInitialImage failed:', e.message);
+      }
+      continue;
+    }
+  }
+
+  try {
+    const base = gradientBackgroundSVG();
+    const finalBuf = IMAGE_TEXT_OVERLAY ? await composeTextOverBackground(base, prod) : base;
+    return await rehostToSupabase(finalBuf, `${prod.name}_fallback.png`, table);
+  } catch (e) {
+    console.warn('[img] gradient fallback failed:', e.message);
+    return null;
+  }
+}
+
 async function handleImageChoice(ctx, order) {
   if (!ctx.session.review) return ctx.answerCbQuery();
   await ctx.answerCbQuery();
@@ -1587,10 +1782,11 @@ async function handleImageChoice(ctx, order) {
 bot.action('imgapi_pollinations', (ctx)=>handleImageChoice(ctx, ['pollinations','hf','deepai']));
 bot.action('imgapi_hf',          (ctx)=>handleImageChoice(ctx, ['hf','pollinations','deepai']));
 bot.action('imgapi_deepai',      (ctx)=>handleImageChoice(ctx, ['deepai','pollinations','hf']));
-bot.action('imgapi_local', (ctx) => handleImageChoice(ctx, ['local','pollinations','hf','deepai']));
-
-// tweak Auto to include local as the final step
-bot.action('imgapi_auto',  (ctx) => handleImageChoice(ctx, ['pollinations','hf','deepai','local']));
+bot.action('imgapi_cloudflare', (ctx)=>handleImageChoice(ctx, ['cloudflare','pollinations','hf','deepai','local']));
+bot.action('imgapi_local',       (ctx)=>handleImageChoice(ctx, ['local','pollinations','hf','deepai']));
+bot.action('imgapi_auto', (ctx)=>
+  handleImageChoice(ctx, ['cloudflare','pollinations','hf','deepai','local'])
+);
 
 bot.action('imgapi_cancel', async (ctx) => {
   await ctx.answerCbQuery();
@@ -1601,10 +1797,55 @@ bot.action('imgapi_cancel', async (ctx) => {
   if (ctx.session.review) await presentReview(ctx);
 });
 
-/* ----- media stubs (unchanged/no-op) ----- */
-async function processIncomingImage(_ctx, _fileId) { return; }
-bot.on('photo', async (_ctx) => { return; });
-bot.on('document', async (_ctx) => { return; });
+/* ----- media handlers (RESTORED) ----- */
+async function processIncomingImage(ctx, fileId, filenameHint = 'upload.jpg') {
+  try {
+    const table = ctx.session?.review?.table || ctx.session?.table;
+    if (!table) {
+      await ctx.reply('Please choose a table first.', kbChooseTable);
+      return;
+    }
+    const fileUrl = await tgFileUrl(fileId);
+    await ctx.reply('🖼️ Rehosting your image...');
+    const hosted = await rehostToSupabase(
+      fileUrl,
+      `${sanitizeForFilename(ctx.session?.review?.prod?.name || filenameHint)}`,
+      table
+    );
+    if (ctx.session?.review?.prod) {
+      ctx.session.review.prod.image = hosted;
+      if (ctx.session.await === 'image_url') ctx.session.await = null;
+      await presentReview(ctx);
+    } else {
+      ctx.session.lastUploadedImage = hosted;
+      await ctx.reply('✅ Image uploaded. I’ll use it when we get to the review.');
+    }
+  } catch (e) {
+    console.error('[upload] manual image failed:', e);
+    await ctx.reply(`❌ Could not process the image: ${e.message}`);
+  }
+}
+
+bot.on('photo', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const photos = ctx.message?.photo || [];
+  if (!photos.length) return;
+  const best = photos[photos.length - 1];
+  const fileId = best.file_id;
+  const hint = (ctx.message?.caption || ctx.session?.review?.prod?.name || 'upload') + '.jpg';
+  await processIncomingImage(ctx, fileId, hint);
+});
+
+bot.on('document', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const doc = ctx.message?.document;
+  if (!doc) return;
+  const mime = doc.mime_type || '';
+  if (!/^image\//i.test(mime)) return;
+  const fileId = doc.file_id;
+  const hint = doc.file_name || ctx.session?.review?.prod?.name || 'upload';
+  await processIncomingImage(ctx, fileId, hint);
+});
 
 /* ----- cancel / save ----- */
 bot.action('cancel', (ctx) => {
@@ -1620,39 +1861,36 @@ bot.action('save', async (ctx) => {
   if (!ctx.session?.review) return;
 
   const { prod, ai, table, updateId } = ctx.session.review;
-const insertData = ctx.session.table === TABLES.products
-  ? {
-      name: prod.name,
-      plan: prod.plan || ai.plan || null,
-      validity: prod.validity || ai.validity || null,
-      price: prod.price || ai.price || null,
-      originalPrice: prod.originalPrice || null,
-      description: prod.description || ai.description || null,
-      category: prod.category || ai.category || null,
-      subcategory: prod.subcategory || ai.subcategory || null,
-      stock: prod.stock || null,
-      tags: uniqMerge(prod.tags, ai.tags),
-      features: ai.features || [],      // products table has this
-      image: prod.image,                // products: image
-      is_active: true
-    }
-  : {
-      name: prod.name,
-      description: prod.description || ai.description || null,
-      price: prod.price || ai.price || null,
-      is_active: true,
-      tags: uniqMerge(prod.tags, ai.tags),
-      image_url: prod.image             // exclusive: save to image_url
-      // NO features here (column doesn't exist)
-    };
+  const isProducts = table === TABLES.products;
+
+  const insertData = isProducts
+    ? {
+        name: prod.name,
+        plan: prod.plan || ai.plan || null,
+        validity: prod.validity || ai.validity || null,
+        price: prod.price || ai.price || null,
+        originalPrice: prod.originalPrice || null,
+        description: prod.description || ai.description || null,
+        category: prod.category || ai.category || null,
+        subcategory: prod.subcategory || ai.subcategory || null,
+        stock: prod.stock || null,
+        tags: uniqMerge(prod.tags, ai.tags),
+        features: ai.features || [],
+        image: prod.image,               // products.image
+        is_active: true
+      }
+    : {
+        name: prod.name,
+        description: prod.description || ai.description || null,
+        price: prod.price || ai.price || null,
+        is_active: true,
+        tags: uniqMerge(prod.tags, ai.tags),
+        image_url: prod.image            // exclusive_products.image_url
+      };
 
   try {
     if (updateId) {
-      const { error } = await supabase
-        .from(table)
-        .update(insertData)
-        .eq('id', updateId);
-
+      const { error } = await supabase.from(table).update(insertData).eq('id', updateId);
       if (error) throw error;
       await ctx.reply('✅ Product updated successfully.');
     } else {
@@ -1668,10 +1906,7 @@ const insertData = ctx.session.table === TABLES.products
         return;
       }
 
-      const { error } = await supabase
-        .from(table)
-        .insert([insertData]);
-
+      const { error } = await supabase.from(table).insert([insertData]);
       if (error) throw error;
       await ctx.reply('✅ Product added successfully.');
     }
@@ -1680,24 +1915,18 @@ const insertData = ctx.session.table === TABLES.products
     ctx.session.await = null;
     ctx.session.mode = null;
 
-    await ctx.reply('What next?', Markup.inlineKeyboard([
-      [Markup.button.callback('➕ Add Another', 'smartadd')],
-      [Markup.button.callback('🏁 Done', 'done')]
-    ]));
+    await ctx.reply('What next?', kbAfterTask);
   } catch (err) {
     console.error(err);
     await ctx.reply(`❌ Error saving: ${err.message}`);
   }
 });
 
-
-/* ----- placeholders to preserve your "Unchanged" comments ----- */
-// ---- helpers to map DB row -> review objects ----
+/* ----- helpers to map DB row -> review objects ----- */
 function rowToReview(table, row) {
   const isProducts = table === TABLES.products;
   const imgCol = isProducts ? 'image' : 'image_url';
 
-  // what the user can edit directly (text & simple fields)
   const prod = {
     name: row.name || '',
     plan: row.plan ?? null,
@@ -1712,13 +1941,12 @@ function rowToReview(table, row) {
     subcategory: isProducts ? (row.subcategory || null) : undefined,
   };
 
-  // what AI normally fills (keep consistent with your save flow)
   const ai = {
     description: row.description || '',
     category: isProducts ? (row.category || 'Download') : 'Download',
     subcategory: isProducts ? (row.subcategory || 'unknown') : 'unknown',
     tags: Array.isArray(row.tags) ? row.tags : [],
-    features: Array.isArray(row.features) ? row.features : [],
+    features: Array.isArray(row?.features) ? row.features : [],
     name: row.name || '',
     plan: row.plan ?? 'unknown',
     validity: row.validity ?? 'unknown',
@@ -1728,7 +1956,7 @@ function rowToReview(table, row) {
   return { prod, ai };
 }
 
-// ---- /update command ----
+/* ---- /update command ---- */
 bot.command('update', async (ctx) => {
   if (!isAdmin(ctx)) return;
   if (!ctx.session.table) return ctx.reply('Choose table first with /table');
@@ -1737,10 +1965,9 @@ bot.command('update', async (ctx) => {
   const id = parts[1];
   if (!id) return ctx.reply('Usage: /update <id>');
 
-  // fetch the row
   const selCols = ctx.session.table === TABLES.products
     ? 'id,name,plan,validity,price,originalPrice,description,category,subcategory,stock,tags,features,image,is_active'
-    : 'id,name,description,price,tags,features,image_url,is_active';
+    : 'id,name,description,price,tags,image_url,is_active';
 
   const { data: row, error } = await supabase
     .from(ctx.session.table)
@@ -1751,7 +1978,6 @@ bot.command('update', async (ctx) => {
   if (error) return ctx.reply(`DB error: ${error.message}`);
   if (!row) return ctx.reply('Not found.');
 
-  // build review state (reuses your existing save/update flow)
   const { prod, ai } = rowToReview(ctx.session.table, row);
 
   ctx.session.review = {
@@ -1764,11 +1990,10 @@ bot.command('update', async (ctx) => {
   ctx.session.mode = null;
   ctx.session.await = null;
 
-  // show editable review
   await presentReview(ctx);
 });
 
-// ---- back to review after editing which field ----
+/* ---- back to review after editing which field ---- */
 bot.action('back_review', async (ctx) => {
   if (!isAdmin(ctx)) return;
   if (!ctx.session?.review) { await ctx.answerCbQuery(); return; }
