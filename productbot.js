@@ -1,6 +1,23 @@
 'use strict';
 
+const fs = require('fs');
 const path = require('path');
+
+// --- embed font in SVGs (works on Railway, Docker, anywhere) ---
+const FONT_PATH = path.join(__dirname, 'assets', 'Inter.ttf');
+const EMBED_FONT_B64 = fs.readFileSync(FONT_PATH).toString('base64');
+const SVG_FONT_STYLE = `
+  <style>
+    @font-face {
+      font-family: "AppInter";
+      src: url(data:font/ttf;base64,${EMBED_FONT_B64}) format("truetype");
+      font-weight: 100 900;
+      font-style: normal;
+    }
+    .title { font-family: "AppInter", sans-serif; font-weight: 800; }
+    .sub   { font-family: "AppInter", sans-serif; font-weight: 600; }
+  </style>`;
+
 require('dotenv').config({ path: path.resolve(__dirname, '.env'), quiet: true });
 
 const { Telegraf, session, Markup } = require('telegraf');
@@ -570,17 +587,18 @@ async function composeTextOverBackground(backgroundBuffer, prod) {
   ).join('');
 
  const overlaySvg = `
-<svg width="${canvasW}" height="${canvasH}" viewBox="0 0 ${canvasW} ${canvasH}" xmlns="http://www.w3.org/2000/svg">
+<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">
   ${SVG_FONT_STYLE}
   <rect width="100%" height="100%" fill="black" opacity="0.35"/>
   <text class="title" text-anchor="middle" font-size="${titleFont}" fill="#FFFFFF">
     ${titleTspans}
   </text>
-  ${details.map((line, i) => {
-    const yPos = Math.min(y + i * Math.round(detailFont * 1.2 + gapSm), canvasH - 64);
-    return `<text class="sub" x="${canvasW/2}" y="${yPos}" text-anchor="middle" font-size="${detailFont}" fill="#E5E7EB">${esc(line)}</text>`;
-  }).join('')}
+  ${planText ? `
+  <text class="sub" x="${W/2}" y="${planY}" text-anchor="middle" font-size="${planFont}" fill="#E5E7EB">
+    ${escXML(planText)}
+  </text>` : ''}
 </svg>`.trim();
+
 
 
   const overlayBuf = await _sharp(Buffer.from(overlaySvg)).png().toBuffer();
