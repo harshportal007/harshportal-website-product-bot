@@ -1,6 +1,23 @@
 'use strict';
 
+const fs = require('fs');
 const path = require('path');
+
+// --- embed font in SVGs (works on Railway, Docker, anywhere) ---
+const FONT_PATH = path.join(__dirname, 'assets', 'Inter.ttf'); // path to your font file
+const EMBED_FONT_B64 = fs.readFileSync(FONT_PATH).toString('base64');
+const SVG_FONT_STYLE = `
+  <style>
+    @font-face {
+      font-family: "AppInter";
+      src: url(data:font/ttf;base64,${EMBED_FONT_B64}) format("truetype");
+      font-weight: 100 900;
+      font-style: normal;
+    }
+    .title { font-family: "AppInter", sans-serif; font-weight: 800; }
+    .sub   { font-family: "AppInter", sans-serif; font-weight: 600; }
+  </style>`;
+
 require('dotenv').config({ path: path.resolve(__dirname, '.env'), quiet: true });
 
 const { Telegraf, session, Markup } = require('telegraf');
