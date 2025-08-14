@@ -662,7 +662,7 @@ async function generateImageFromCloudflare(
     height = 768,
     steps = 4,
     guidance = 3.5,
-    //negative_prompt = 'nsfw, nude, nudity, cleavage, erotic, sexual, suggestive, bikini, lingerie, skin, body, people, face, human, watermark, text, logo, hands, portrait, character, anime, cartoon, doll, ugly, deformed'
+    negative_prompt = 'nsfw, nude, nudity, cleavage, erotic, sexual, suggestive, bikini, lingerie, skin, body, people, face, human, watermark, text, logo, hands, portrait, character, anime, cartoon, doll, ugly, deformed'
   } = {}
 ) {
   if (!CF_ACCOUNT_ID || !CF_API_TOKEN) {
