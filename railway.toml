@@ -1,13 +1,3 @@
+
 [nixpacks]
-packages = [
-  "fontconfig",
-  "fonts-dejavu-core",
-  "fonts-noto-core",
-  "fonts-noto-cjk",
-  "fonts-noto-color-emoji"
-"libcairo2",
-"libpango-1.0-0",
-"libjpeg-turbo8",
-"libgif7",
-"librsvg2-2"
-]
+packages = ["libcairo2","libpango-1.0-0","libjpeg-turbo8","libgif7","librsvg2-2"]
