@@ -569,21 +569,19 @@ async function composeTextOverBackground(backgroundBuffer, prod) {
       : `<tspan x="${W/2}" dy="${Math.round(titleFont * lhTitle)}">${escXML(line)}</tspan>`
   ).join('');
 
-  const overlaySvg = `
-<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">
+ const overlaySvg = `
+<svg width="${canvasW}" height="${canvasH}" viewBox="0 0 ${canvasW} ${canvasH}" xmlns="http://www.w3.org/2000/svg">
+  ${SVG_FONT_STYLE}
   <rect width="100%" height="100%" fill="black" opacity="0.35"/>
-  <text text-anchor="middle"
-        font-family="DejaVu Sans, Noto Sans, Liberation Sans, Arial, Helvetica, sans-serif"
-        font-size="${titleFont}" font-weight="800" fill="#FFFFFF">
+  <text class="title" text-anchor="middle" font-size="${titleFont}" fill="#FFFFFF">
     ${titleTspans}
   </text>
-  ${planText ? `
-  <text x="${W/2}" y="${planY}" text-anchor="middle"
-        font-family="DejaVu Sans, Noto Sans, Liberation Sans, Arial, Helvetica, sans-serif"
-        font-size="${planFont}" font-weight="600" fill="#E5E7EB">
-    ${escXML(planText)}
-  </text>` : ''}
+  ${details.map((line, i) => {
+    const yPos = Math.min(y + i * Math.round(detailFont * 1.2 + gapSm), canvasH - 64);
+    return `<text class="sub" x="${canvasW/2}" y="${yPos}" text-anchor="middle" font-size="${detailFont}" fill="#E5E7EB">${esc(line)}</text>`;
+  }).join('')}
 </svg>`.trim();
+
 
   const overlayBuf = await _sharp(Buffer.from(overlaySvg)).png().toBuffer();
 
@@ -1116,14 +1114,17 @@ async function createInitialImage(prod) {
 
   const overlaySvg = `
 <svg width="${canvasW}" height="${canvasH}" viewBox="0 0 ${canvasW} ${canvasH}" xmlns="http://www.w3.org/2000/svg">
+  ${SVG_FONT_STYLE}
   <rect width="100%" height="100%" fill="black" opacity="0.35"/>
-  <text text-anchor="middle"
-        font-family="Arial, Helvetica, DejaVu Sans, sans-serif"
-        font-size="${titleFont}" font-weight="800" fill="#FFFFFF">
+  <text class="title" text-anchor="middle" font-size="${titleFont}" fill="#FFFFFF">
     ${titleTspans}
   </text>
-  ${detailNodes}
+  ${details.map((line, i) => {
+    const yPos = Math.min(y + i * Math.round(detailFont * 1.2 + gapSm), canvasH - 64);
+    return `<text class="sub" x="${canvasW/2}" y="${yPos}" text-anchor="middle" font-size="${detailFont}" fill="#E5E7EB">${esc(line)}</text>`;
+  }).join('')}
 </svg>`.trim();
+
 
   if (!_sharp) return Buffer.from(bgSvg);
   const bgBuf = await _sharp(Buffer.from(bgSvg)).png().toBuffer();
