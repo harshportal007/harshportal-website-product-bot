@@ -757,10 +757,10 @@ async function generateImageFromCloudflare(
     return null;
   }
 
-  // 1) Guard model slug
+  // Ensure model path is the unencoded @cf/... slug
   if (!/^@cf\//.test(model)) model = '@cf/black-forest-labs/flux-1-schnell';
 
-  // 2) Force SFW, abstract background (reduce safety triggers)
+  // SFW / background-only prompt
   const safePrompt = [
     String(prompt || '')
       .replace(/\banime|animation|character\b/gi, 'abstract motion graphics')
@@ -769,53 +769,78 @@ async function generateImageFromCloudflare(
     'abstract geometric product background, shapes only, no people, no faces, no bodies, no text, SFW, corporate, clean'
   ].join('. ');
 
-  // 3) Coerce dimensions
   const W = Math.max(256, parseInt(width, 10) || 768);
   const H = Math.max(256, parseInt(height, 10) || 768);
 
-  const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${encodeURIComponent(model)}`;
+  const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${model}`;
   console.log('[img] Cloudflare URL:', url);
 
   const body = { prompt: safePrompt, negative_prompt, width: W, height: H, num_steps: steps, guidance };
 
   const res = await fetch(url, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${CF_API_TOKEN}`, 'Content-Type': 'application/json' },
+    headers: {
+      Authorization: `Bearer ${CF_API_TOKEN}`,
+      'Content-Type': 'application/json',
+      // 👇 helps when CF returns JSON; harmless if it returns image/*
+      Accept: 'application/json'
+    },
     body: JSON.stringify(body),
     signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(60000) : undefined
   });
 
+  const ct = res.headers.get('content-type') || '';
+
+  // Non-2xx: surface full error text (useful for 7000/7003/permissions)
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
     if (/NSFW|safety|adult/i.test(txt)) {
-      console.warn('[img] Cloudflare blocked prompt (NSFW); falling back.');
+      console.warn('[img] Cloudflare blocked prompt (NSFW-ish); falling back.');
       return null;
     }
     if (res.status === 429 || /rate|quota|limit/i.test(txt)) {
       console.warn('[img] Cloudflare rate/quota; falling back.');
       return null;
     }
-    throw new Error(`Cloudflare AI HTTP ${res.status}: ${txt.slice(0, 200)}`);
+    throw new Error(`Cloudflare AI HTTP ${res.status}: ${txt.slice(0, 500)}`);
   }
 
-  const ct = res.headers.get('content-type') || '';
+  // Direct image bytes?
   if (ct.startsWith('image/')) {
-    // Direct image bytes response
     return Buffer.from(await res.arrayBuffer());
   }
 
-  // 4) Be generous about response shapes
-  let data = null;
-  try { data = await res.json(); } catch { /* ignore */ }
+  // JSON case: check success + decode base64
+  let json;
+  try {
+    json = await res.json();
+  } catch {
+    // Sometimes CF sends JSON with odd headers; try text->parse
+    const txt = await res.text().catch(() => '');
+    try { json = JSON.parse(txt); } catch {
+      throw new Error(`Cloudflare returned non-image, non-JSON payload: ${txt.slice(0, 500)}`);
+    }
+  }
 
-  const result = data?.result ?? data ?? {};
+  // If CF wrapped with success/errors
+  if (json && json.success === false) {
+    const msg = (json.errors && json.errors[0] && json.errors[0].message) || 'Unknown Cloudflare error';
+    throw new Error(`Cloudflare AI error: ${msg}`);
+  }
+
+  const result = json?.result ?? json ?? {};
   const b64 =
     result.image ||
     result.images?.[0] ||
     result.output?.[0] ||
-    data?.image;
+    json?.image;
 
-  if (!b64) return null;
+  if (!b64) {
+    // Surface the full JSON to logs for debugging
+    console.warn('[img] Cloudflare JSON had no image field:', JSON.stringify(json).slice(0, 500));
+    return null;
+  }
+
   return Buffer.from(b64, 'base64');
 }
 
@@ -1093,11 +1118,23 @@ async function geminiTextJSON(systemPrompt, userPrompt) {
   return null;
 }
 
-function buildImagePrompt(prod) {
-  const name = prod?.name || 'Unnamed Product';
-  const plan = prod?.plan || '';
-  return `Cinematic, professional product background for "${name}" ${plan}, 4K, modern, clean, vibrant, soft lighting, high detail`;
+function buildImagePrompt(prod = {}) {
+  const name = (prod.name || 'Unnamed Product').trim();
+  const plan = (prod.plan && !/^(unknown|null|n\/a|na|none|-|\s*)$/i.test(String(prod.plan)))
+    ? String(prod.plan).trim()
+    : '';
+  const desc = (prod.description || '').replace(/\s+/g, ' ').trim();
+  const shortDesc = desc.length > 220 ? desc.slice(0, 220) + '…' : desc;
+
+  return [
+    `High-quality, detailed hero image for: ${name}${plan ? ' — ' + plan : ''}.`,
+    shortDesc ? `Visual theme inspired by: ${shortDesc}.` : '',
+    'No text, no watermarks, no logos, ultra realistic, 4K, photorealistic lighting, cinematic style'
+  ]
+  .filter(Boolean)
+  .join(' ');
 }
+
 
 async function createInitialImage(prod) {
   const title = shortBrandName(prod);
@@ -1780,25 +1817,14 @@ async function generateBackgroundWithOrder(prod, table, order = []) {
   const prompt = buildImagePrompt(prod);
   console.log('[img] Using image prompt:', prompt);
 
+  // No overlay except for local card fallback
   for (const provider of order) {
     let buf = null;
 
     if (provider === 'pollinations') {
       buf = await tryWithRetries('image:pollinations', () => generateImageFromPollinations(prompt), IMAGE_RETRIES);
       if (buf && buf.length) {
-        const composed = IMAGE_TEXT_OVERLAY ? await composeTextOverBackground(buf, prod) : buf;
-        try { return await rehostToSupabase(composed, `${prod.name}_ai.png`, table); }
-        catch (e) { console.warn('[img] rehost after pollinations failed:', e.message); }
-      }
-      continue;
-    }
-
-    if (provider === 'hf') {
-      buf = await tryWithRetries('image:hf', () => generateImageFromHuggingFace(prompt), IMAGE_RETRIES);
-      if (buf && buf.length) {
-        const composed = await composeTextOverBackground(buf, prod);
-        try { return await rehostToSupabase(composed, `${prod.name}_ai.png`, table); }
-        catch (e) { console.warn('[img] rehost after hf failed:', e.message); }
+        return await rehostToSupabase(buf, `${prod.name}_poll.png`, table);
       }
       continue;
     }
@@ -1806,40 +1832,35 @@ async function generateBackgroundWithOrder(prod, table, order = []) {
     if (provider === 'deepai') {
       buf = await tryWithRetries('image:deepai', () => generateImageFromDeepAI(prompt), IMAGE_RETRIES);
       if (buf && buf.length) {
-        const composed = IMAGE_TEXT_OVERLAY ? await composeTextOverBackground(buf, prod) : buf;
-        try { return await rehostToSupabase(composed, `${prod.name}_ai.png`, table); }
-        catch (e) { console.warn('[img] rehost after deepai failed:', e.message); }
+        return await rehostToSupabase(buf, `${prod.name}_deepai.png`, table);
+      }
+      continue;
+    }
+
+    if (provider === 'hf') {
+      buf = await tryWithRetries('image:hf', () => generateImageFromHuggingFace(prompt), IMAGE_RETRIES);
+      if (buf && buf.length) {
+        return await rehostToSupabase(buf, `${prod.name}_hf.png`, table);
       }
       continue;
     }
 
     if (provider === 'cloudflare') {
-  const buf = await tryWithRetries('image:cloudflare', () => generateImageFromCloudflare(prompt), IMAGE_RETRIES);
-  if (buf && buf.length) {
-    const composed = IMAGE_TEXT_OVERLAY ? await composeTextOverBackground(buf, prod) : buf;
-    try { return await rehostToSupabase(composed, `${prod.name}_cf.png`, table); }
-    catch (e) { console.warn('[img] rehost after cloudflare failed:', e.message); }
-  }
-  continue;
-}
-
-    if (provider === 'local') {
-      try {
-        const localBuf = await createInitialImage(prod);
-        return await rehostToSupabase(localBuf, `${prod.name}_local.png`, table);
-      } catch (e) {
-        console.warn('[img] local createInitialImage failed:', e.message);
+      buf = await tryWithRetries('image:cloudflare', () => generateImageFromCloudflare(prompt), IMAGE_RETRIES);
+      if (buf && buf.length) {
+        return await rehostToSupabase(buf, `${prod.name}_cf.png`, table);
       }
       continue;
     }
   }
 
+  // Final fallback — only here we overlay text
   try {
     const base = gradientBackgroundSVG();
-    const finalBuf = IMAGE_TEXT_OVERLAY ? await composeTextOverBackground(base, prod) : base;
+    const finalBuf = await composeTextOverBackground(base, prod); // overlay ON local fallback
     return await rehostToSupabase(finalBuf, `${prod.name}_fallback.png`, table);
   } catch (e) {
-    console.warn('[img] gradient fallback failed:', e.message);
+    console.error('[img] Fallback generation failed', e);
     return null;
   }
 }
@@ -1875,7 +1896,7 @@ bot.action('imgapi_deepai',      (ctx)=>handleImageChoice(ctx, ['deepai','pollin
 bot.action('imgapi_cloudflare', (ctx)=>handleImageChoice(ctx, ['cloudflare','pollinations','hf','deepai','local']));
 bot.action('imgapi_local',       (ctx)=>handleImageChoice(ctx, ['local','pollinations','hf','deepai']));
 bot.action('imgapi_auto', (ctx)=>
-  handleImageChoice(ctx, ['cloudflare','pollinations','hf','deepai','local'])
+  handleImageChoice(ctx, ['cloudflare','hf','deepai','pollinations','local'])
 );
 
 bot.action('imgapi_cancel', async (ctx) => {
