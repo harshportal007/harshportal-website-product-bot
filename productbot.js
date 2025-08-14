@@ -3,7 +3,6 @@
 const fs = require('fs');
 const path = require('path');
 
-// --- embed font in SVGs (works on Railway, Docker, anywhere) ---
 const FONT_PATH = path.join(__dirname, 'assets', 'Inter.ttf');
 const EMBED_FONT_B64 = fs.readFileSync(FONT_PATH).toString('base64');
 const SVG_FONT_STYLE = `
@@ -17,6 +16,75 @@ const SVG_FONT_STYLE = `
     .title { font-family: "AppInter", sans-serif; font-weight: 800; }
     .sub   { font-family: "AppInter", sans-serif; font-weight: 600; }
   </style>`;
+
+// Also allow a file:// URL fallback for SVG renderers that ignore data: fonts
+const ABS_FONT = path.resolve(FONT_PATH).replace(/\\/g, '/');
+const SVG_FONT_STYLE_FILE = `
+  <style>
+    @font-face {
+      font-family: "AppInter";
+      src: url("file://${ABS_FONT}") format("truetype");
+      font-weight: 100 900;
+      font-style: normal;
+    }
+    .title { font-family: "AppInter", sans-serif; font-weight: 800; }
+    .sub   { font-family: "AppInter", sans-serif; font-weight: 600; }
+  </style>`;
+
+// Optional but recommended: draw text with node-canvas (works everywhere)
+let _canvas = null;
+try { _canvas = require('canvas'); }
+catch (e) { console.warn('[img] canvas not available:', e.message); }
+
+// Helper to rasterize the text overlay using the bundled font
+async function rasterizeTextOverlayPNG(W, H, titleLines, titleFontPx, planText, planFontPx) {
+  if (!_canvas) return null;
+  const { createCanvas, registerFont } = _canvas;
+
+  // Ensure our bundled font is registered under "AppInter"
+  try { registerFont(FONT_PATH, { family: 'AppInter' }); }
+  catch (e) {
+    // ignore re-register errors on hot reloads
+  }
+
+  const c = createCanvas(W, H);
+  const ctx = c.getContext('2d');
+
+  // dark veil
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fillRect(0, 0, W, H);
+
+  // title
+  ctx.fillStyle = '#FFFFFF';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
+  ctx.font = `800 ${titleFontPx}px AppInter`;
+
+  const lhTitle = 1.15;
+  const titleBlockHeight = Math.round(titleFontPx * (titleLines.length + (titleLines.length - 1) * (lhTitle - 1)));
+  const titleYStart = Math.round(H * 0.50) - Math.round(titleBlockHeight * 0.25);
+
+  let y = titleYStart;
+  for (let i = 0; i < titleLines.length; i++) {
+    if (i > 0) y += Math.round(titleFontPx * lhTitle);
+    ctx.fillText(titleLines[i], W / 2, y);
+  }
+
+  // plan
+  if (planText) {
+    const minGapPx = Math.max(Math.round(titleFontPx * 0.22), 28);
+    const lastBaseline = y;
+    const planY = lastBaseline + Math.round(titleFontPx * 0.9) + minGapPx;
+
+    ctx.fillStyle = '#E5E7EB';
+    ctx.font = `600 ${planFontPx}px AppInter`;
+    ctx.fillText(planText, W / 2, planY);
+  }
+
+  return c.toBuffer('image/png');
+}
+
+
 
 require('dotenv').config({ path: path.resolve(__dirname, '.env'), quiet: true });
 
@@ -563,32 +631,38 @@ async function composeTextOverBackground(backgroundBuffer, prod) {
   // wider canvases can fit more chars per line
   const maxChars = Math.max(12, Math.round(18 * (W / 1024)));
   let titleLines = wrapByChars(titleRaw, maxChars);
-  // nudge down font if text still too long
   while (titleLines.join(' ').length > maxChars * 2 && titleFont > 28) {
     titleFont -= 2;
     titleLines = wrapByChars(titleRaw, maxChars);
   }
   titleLines = titleLines.slice(0, 2);
 
+  // 4) First try the canvas overlay (bullet-proof)
+  const raster = await rasterizeTextOverlayPNG(W, H, titleLines, titleFont, planText, planFont);
+  if (raster) {
+    return base
+      .composite([{ input: raster, left: 0, top: 0 }])
+      .png()
+      .toBuffer();
+  }
+
+  // 5) Fallback to SVG overlay with our bundled font via file:// URL
   const lhTitle = 1.15;
   const titleBlockHeight = Math.round(titleFont * (titleLines.length + (titleLines.length - 1) * (lhTitle - 1)));
-
-  // 4) Vertical layout
   const titleY = Math.round(H * 0.50) - Math.round(titleBlockHeight * 0.25);
   const minGapPx = Math.max(Math.round(titleFont * 0.22), Math.round(28 * scale));
   const lastTitleBaseline = titleY + Math.round((titleLines.length - 1) * (titleFont * lhTitle));
   const planY = planText ? (lastTitleBaseline + Math.round(titleFont * 0.9) + minGapPx) : null;
 
-  // 5) Build overlay SVG at EXACT WxH
   const titleTspans = titleLines.map((line, i) =>
     i === 0
       ? `<tspan x="${W/2}" y="${titleY}">${escXML(line)}</tspan>`
       : `<tspan x="${W/2}" dy="${Math.round(titleFont * lhTitle)}">${escXML(line)}</tspan>`
   ).join('');
 
- const overlaySvg = `
+  const overlaySvg = `
 <svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">
-  ${SVG_FONT_STYLE}
+  ${SVG_FONT_STYLE_FILE /* use file:// font for resvg/libvips */}
   <rect width="100%" height="100%" fill="black" opacity="0.35"/>
   <text class="title" text-anchor="middle" font-size="${titleFont}" fill="#FFFFFF">
     ${titleTspans}
@@ -599,11 +673,8 @@ async function composeTextOverBackground(backgroundBuffer, prod) {
   </text>` : ''}
 </svg>`.trim();
 
-
-
   const overlayBuf = await _sharp(Buffer.from(overlaySvg)).png().toBuffer();
 
-  // 6) Composite — overlay is guaranteed <= base now
   return base
     .composite([{ input: overlayBuf, left: 0, top: 0 }])
     .png()
