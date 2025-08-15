@@ -135,7 +135,7 @@ const groq = new OpenAI({
 });
 
 const hf = new HfInference(HF_KEY);
-const HF_IMAGE_MODEL = 'stabilityai/stable-diffusion-xl-base-1.0';
+const HF_IMAGE_MODEL = 'black-forest-labs/FLUX.1-dev';
 
 /* ---- idle / pause control ---- */
 const INACTIVITY_MS = Math.max(0, parseInt(process.env.INACTIVITY_MS || '300000', 10));
