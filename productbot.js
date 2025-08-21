@@ -1996,6 +1996,7 @@ bot.action('save', async (ctx) => {
         price: prod.price || ai.price || null,
         is_active: true,
         tags: uniqMerge(prod.tags, ai.tags),
+        features: ai.features || [],
         image_url: prod.image            // exclusive_products.image_url
       };
 
@@ -2078,7 +2079,7 @@ bot.command('update', async (ctx) => {
 
   const selCols = ctx.session.table === TABLES.products
     ? 'id,name,plan,validity,price,originalPrice,description,category,subcategory,stock,tags,features,image,is_active'
-    : 'id,name,description,price,tags,image_url,is_active';
+    : 'id,name,plan,validity,description,price,tags,features,image_url,is_active';
 
   const { data: row, error } = await supabase
     .from(ctx.session.table)
