@@ -1974,7 +1974,7 @@ bot.action('save', async (ctx) => {
   const { prod, ai, table, updateId } = ctx.session.review;
   const isProducts = table === TABLES.products;
 
-  const insertData = isProducts
+const insertData = isProducts
     ? {
         name: prod.name,
         plan: prod.plan || ai.plan || null,
@@ -1987,17 +1987,19 @@ bot.action('save', async (ctx) => {
         stock: prod.stock || null,
         tags: uniqMerge(prod.tags, ai.tags),
         features: ai.features || [],
-        image: prod.image,               // products.image
+        image: prod.image,              // products.image
         is_active: true
       }
     : {
         name: prod.name,
+        plan: prod.plan || ai.plan || null, // Corrected: This line was missing
+        validity: prod.validity || ai.validity || null, // Corrected: This line was missing
         description: prod.description || ai.description || null,
         price: prod.price || ai.price || null,
         is_active: true,
         tags: uniqMerge(prod.tags, ai.tags),
         features: ai.features || [],
-        image_url: prod.image            // exclusive_products.image_url
+        image_url: prod.image           // exclusive_products.image_url
       };
 
   try {
