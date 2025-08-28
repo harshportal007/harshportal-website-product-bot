@@ -127,7 +127,10 @@ const TABLES = { products: 'products', exclusive: 'exclusive_products' };
 const CATEGORIES_ALLOWED = ['OTT Accounts', 'IPTV', 'Product Key', 'Download'];
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY
+);
 
 const groq = new OpenAI({
   apiKey: process.env.GROQ_API_KEY,
