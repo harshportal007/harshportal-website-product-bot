@@ -100,7 +100,10 @@ let _sharp = null;
 try { _sharp = require('sharp'); } catch { console.warn('[img] `sharp` not installed. Using minimal fallbacks.'); }
 
 /* -------------------- env checks -------------------- */
-const REQUIRED_ENV = ['TELEGRAM_BOT_TOKEN','SUPABASE_URL','SUPABASE_KEY'];
+const REQUIRED_ENV = ['TELEGRAM_BOT_TOKEN','SUPABASE_URL'];
+if (!process.env.SUPABASE_SERVICE_ROLE_KEY && !process.env.SUPABASE_KEY) {
+  console.error('❌ Missing env: SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY)');
+}
 for (const k of REQUIRED_ENV) if (!process.env[k]) console.error(`❌ Missing env: ${k}`);
 
 const HF_KEY = process.env.HUGGING_FACE_API_KEY || '';
