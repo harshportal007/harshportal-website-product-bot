@@ -2141,10 +2141,9 @@ bot.catch((err, ctx) => {
 });
 
 (async () => {
-   if (process.env.MODE === 'webhook') {
-    // Vercel/Serverless: export the bot only. api/telegram.js will call webhookCallback.
-    module.exports = { bot };
-  } else {
+ if (process.env.MODE === 'webhook') {
+  module.exports = bot; // not { bot }
+} else {
     // Local/Railway: long-polling
     const shutdown = async (signal) => {
       console.log(`\n${signal} received. Stopping bot...`);
