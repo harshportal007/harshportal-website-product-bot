@@ -2,10 +2,17 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
-
 const FONT_PATH = path.join(__dirname, 'assets', 'Inter.ttf');
-const EMBED_FONT_B64 = fs.readFileSync(FONT_PATH).toString('base64');
-const SVG_FONT_STYLE = `
+
+// ✅ Safe font embedding (no crash if file missing)
+let EMBED_FONT_B64 = '';
+try {
+  EMBED_FONT_B64 = fs.readFileSync(FONT_PATH).toString('base64');
+} catch (e) {
+  console.warn('[img] Inter.ttf not found, falling back to system fonts');
+}
+const SVG_FONT_STYLE = EMBED_FONT_B64
+  ? `
   <style>
     @font-face {
       font-family: "AppInter";
@@ -15,7 +22,12 @@ const SVG_FONT_STYLE = `
     }
     .title { font-family: "AppInter", sans-serif; font-weight: 800; }
     .sub   { font-family: "AppInter", sans-serif; font-weight: 600; }
-  </style>`;
+  </style>`
+  : `<style>
+      .title { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; font-weight: 800; }
+      .sub   { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; font-weight: 600; }
+    </style>`;
+
 
 // Also allow a file:// URL fallback for SVG renderers that ignore data: fonts
 const ABS_FONT = path.resolve(FONT_PATH).replace(/\\/g, '/');
