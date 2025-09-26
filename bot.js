@@ -1498,24 +1498,15 @@ bot.command('setcommands', async (ctx) => {
     await ctx.reply('✅ Bot commands have been manually refreshed.');
 });
 
+/* ---------------- Launch ---------------- */
 if (process.env.MODE === "webhook") {
-  console.log("Bot running in webhook mode...");
-  setBotCommands();
-  module.exports = async (req, res) => {
-    try {
-      await bot.handleUpdate(req.body, res);
-    } catch (e) {
-      console.error("Error handling webhook:", e);
-      res.statusCode = 500;
-      res.end("Error processing update");
-    }
-  };
+  console.log("🌐 Bot running in webhook mode (Vercel)...");
+  // Do not launch here, just export
 } else {
-  // Local or Railway: long-polling
+  // Local / Railway: long-polling
   (async () => {
     try {
       await bot.launch({ dropPendingUpdates: true });
-      await setBotCommands();
       console.log("🤖 Bot running in long-polling mode...");
     } catch (e) {
       console.error("Failed to launch bot in long-polling mode:", e);
@@ -1535,3 +1526,6 @@ if (process.env.MODE === "webhook") {
   process.once("SIGINT", () => shutdown("SIGINT"));
   process.once("SIGTERM", () => shutdown("SIGTERM"));
 }
+
+/* ---------------- Always export bot ---------------- */
+module.exports = bot;

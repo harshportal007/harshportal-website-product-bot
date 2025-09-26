@@ -1,7 +1,8 @@
 'use strict';
 
-const bot = require('../bot'); // adjust path
+const bot = require('../bot');  // import the Telegraf bot
 
+// Use Telegraf's webhookCallback directly
 const handleUpdate = bot.webhookCallback('/api/telegram');
 
 module.exports = async (req, res) => {
@@ -13,7 +14,7 @@ module.exports = async (req, res) => {
     await handleUpdate(req, res);
     if (!res.writableEnded) res.status(200).end();
   } catch (err) {
-    console.error('webhook error', err);
-    if (!res.writableEnded) res.status(200).end();
+    console.error('[telegram webhook error]', err);
+    if (!res.writableEnded) res.status(500).send('Error processing update');
   }
 };
